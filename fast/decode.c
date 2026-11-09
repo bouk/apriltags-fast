@@ -455,9 +455,15 @@ AT_INLINE double lane_weight(const uint8_t *im, int64_t s, double x0, double y0,
     return ok && !(g1 < g2) ? d * d : 0.0;
 }
 
+/* The points of a batch: n + 8 for n steps, and one more for the step
+   after them (the last step of refine_edges). */
+#define RB_EXTRA 9
+
 /* The weights of steps 0..n-1 of one sample point, all inside the
-   image, into fbuf[0..n]. fbuf[n..2n] holds the steps' n, and the last m
-   entries the point offsets rf - 1 + 0.25 * j (refine_tables); the rest
+   image, into fbuf[0..n], from the bilinear values of points 0..m-1
+   (m = n + 8, or n + 9 for the step after them). fbuf[n..2n] holds the
+   steps' n, then come fa, bs, g and the point offsets
+   rf - 1 + 0.25 * j (refine_tables), n + RB_EXTRA entries each; the rest
    of fbuf, ibuf and pbuf is scratch.
 
    The second point of step k, x0 + (n - 1) * nx - 0.5, is the first
@@ -502,12 +508,12 @@ AT_INLINE void rb_weights(const double *restrict g1s, const double *restrict g2s
 }
 
 AT_INLINE void refine_batch(const uint8_t *restrict im, int64_t s, double x0, double y0, double nx, double ny,
-                            int64_t n, double *restrict fbuf, int64_t *restrict ibuf, uint32_t *restrict pbuf) {
-    int64_t m = n + 8;
+                            int64_t n, int64_t m, double *restrict fbuf, int64_t *restrict ibuf,
+                            uint32_t *restrict pbuf) {
     double *wgt = fbuf;
-    int64_t o = 2 * n;
-    double *fa = fbuf + o, *bs = fbuf + o + m, *g = fbuf + o + 2 * m;
-    const double *mjt = fbuf + o + 3 * m;
+    int64_t o = 2 * n, ms = n + RB_EXTRA;
+    double *fa = fbuf + o, *bs = fbuf + o + ms, *g = fbuf + o + 2 * ms;
+    const double *mjt = fbuf + o + 3 * ms;
     int64_t *idx = ibuf;
     uint32_t *pk = pbuf;
     rb_points(mjt, x0, y0, nx, ny, s, m, fa, bs, idx);
@@ -526,6 +532,14 @@ AT_INLINE void refine_batch(const uint8_t *restrict im, int64_t s, double x0, do
     rb_weights(g + 8, g, n, wgt);
 }
 
+/* bilinear1 from a point's fractions and its four pixels in one u32 (as
+   refine_batch packs them), with the same operations. */
+AT_INLINE double bilinear_packed(double a, double b, uint32_t p) {
+    double p00 = (double)(p & 255), p01 = (double)((p >> 8) & 255);
+    double p10 = (double)((p >> 16) & 255), p11 = (double)(p >> 24);
+    return (1.0 - a) * (1.0 - b) * p00 + a * (1.0 - b) * p01 + (1.0 - a) * b * p10 + a * b * p11;
+}
+
 /* The weighted sums of refine_edges over the first vsteps steps (a
    multiple of 4) of one sample point, 4 steps at a time as the C
    library's AVX2 code does: lane l takes the steps congruent to l mod 4.
@@ -542,6 +556,7 @@ SIMD_VOID(refine_lanes,
     double rf = (double)-range;
     double mn0 = 0.0, mn1 = 0.0, mn2 = 0.0, mn3 = 0.0, mc0 = 0.0, mc1 = 0.0, mc2 = 0.0, mc3 = 0.0;
     int64_t step = 0;
+    out[2] = 0.0;
     /* x1, y1, x2 and y2 are monotonic in the step (each operation
        rounds monotonically), so when the first and the last step are
        inside the image, all steps are: no per-step tests or clamps */
@@ -551,7 +566,21 @@ SIMD_VOID(refine_lanes,
                y0 + (rf - 1.0) * ny - 0.5, wl, hl) &&
         in_box(x0 + (nf + 1.0) * nx - 0.5, y0 + (nf + 1.0) * ny - 0.5, x0 + (nf - 1.0) * nx - 0.5,
                y0 + (nf - 1.0) * ny - 0.5, wl, hl)) {
-        refine_batch(im, s, x0, y0, nx, ny, vsteps, fbuf, ibuf, pbuf);
+        /* the step after them (step vsteps), if it is inside the image
+           too (refine_edges tests it the same way) */
+        double nt = rf + 0.25 * (double)vsteps;
+        bool tail = in_box(x0 + (nt + 1.0) * nx - 0.5, y0 + (nt + 1.0) * ny - 0.5, x0 + (nt - 1.0) * nx - 0.5,
+                           y0 + (nt - 1.0) * ny - 0.5, wl, hl);
+        refine_batch(im, s, x0, y0, nx, ny, vsteps, vsteps + 8 + tail, fbuf, ibuf, pbuf);
+        if (tail) {
+            /* its g1 is point vsteps + 8, g2 point vsteps; summed as
+               refine_edges' bilinear1 does */
+            int64_t ms = vsteps + RB_EXTRA;
+            const double *fa = fbuf + 2 * vsteps, *bs = fa + ms;
+            out[2] = 1.0;
+            out[3] = bilinear_packed(fa[vsteps + 8], bs[vsteps + 8], pbuf[vsteps + 8]);
+            out[4] = bilinear_packed(fa[vsteps], bs[vsteps], pbuf[vsteps]);
+        }
         /* the four lanes as one vector (clang does not join the scalar
            sums): the same operations in each lane */
         typedef double v4d __attribute__((vector_size(32), aligned(8)));
@@ -599,12 +628,12 @@ SIMD_VOID(refine_lanes,
 /* The tables of refine_batch in fbuf (n steps, from rf): each step's n,
    and the offset of each sample point. They depend only on the range. */
 static void refine_tables(double *fbuf, int64_t n, double rf) {
-    int64_t m = n + 8;
+    int64_t ms = n + RB_EXTRA;
     double *ns = fbuf + n;
     AT_VFOR(k, 0, n, ns[k] = rf + 0.25 * (double)k;);
     double rm = rf - 1.0;
-    double *mjt = fbuf + 2 * n + 3 * m;
-    AT_VFOR(j, 0, m, mjt[j] = rm + 0.25 * (double)j;);
+    double *mjt = fbuf + 2 * n + 3 * ms;
+    AT_VFOR(j, 0, ms, mjt[j] = rm + 0.25 * (double)j;);
 }
 
 #define PREFETCH_AHEAD 2
@@ -634,10 +663,10 @@ static void refine_edges(at_ctx *cx, float quad_decimate, const ImView *v, Quad 
     const double delta = 0.5;
     int64_t vsteps = imax(max_steps - max_steps % 4, 0);
     at_mark mk = stk_enter(cx);
-    double *fbuf = STK_ALLOC(cx, double, 2 * vsteps + 4 * (vsteps + 8));
+    double *fbuf = STK_ALLOC(cx, double, 2 * vsteps + 4 * (vsteps + RB_EXTRA));
     refine_tables(fbuf, vsteps, (double)-range);
-    int64_t *ibuf = STK_ALLOC(cx, int64_t, vsteps + 8);
-    uint32_t *pbuf = STK_ALLOC(cx, uint32_t, vsteps + 8);
+    int64_t *ibuf = STK_ALLOC(cx, int64_t, vsteps + RB_EXTRA);
+    uint32_t *pbuf = STK_ALLOC(cx, uint32_t, vsteps + RB_EXTRA);
     for (int edge = 0; edge < 4; edge++) {
         int a = edge, b = (edge + 1) & 3;
         double nx = (double)(q->p[b][1] - q->p[a][1]);
@@ -659,11 +688,23 @@ static void refine_edges(at_ctx *cx, float quad_decimate, const ImView *v, Quad 
             double pa = (1.0 + (double)(si + PREFETCH_AHEAD)) / (double)(nsamples + 1);
             prefetch_line(v, pa * q->p[a][0] + (1.0 - pa) * q->p[b][0], pa * q->p[a][1] + (1.0 - pa) * q->p[b][1],
                           nx, ny, range);
-            double lsc[2];
+            double lsc[5];
             refine_lanes(v->im, v->s, w, h, x0, y0, nx, ny, range, vsteps, fbuf, ibuf, pbuf, lsc);
             double mn = 0.0 + lsc[0];
             double mcount = 0.0 + lsc[1];
-            for (int64_t step = vsteps; step < max_steps;) {
+            int64_t step = vsteps;
+            if (lsc[2] != 0.0) {
+                /* refine_lanes did step vsteps: the loop below for it */
+                double n = (double)-range + step_length * (double)step;
+                step++;
+                double g1 = lsc[3], g2 = lsc[4];
+                if (!(g1 < g2)) {
+                    double weight = (g2 - g1) * (g2 - g1);
+                    mn += weight * n;
+                    mcount += weight;
+                }
+            }
+            while (step < max_steps) {
                 double n = (double)-range + step_length * (double)step;
                 step++;
                 double x1 = x0 + (n + 1.0) * nx - delta;

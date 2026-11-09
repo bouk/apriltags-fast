@@ -336,21 +336,29 @@ static void radix_histograms(const uint64_t *a, int64_t n, uint32_t *h) {
     }
 }
 
-/* radix_pass, reading the source from its end. */
-static void radix_pass_back(const uint64_t *src, int64_t n, uint64_t *dst, uint32_t *pos, int shift) {
-    for (int64_t i = n - 1; i >= 0; i--) {
-        uint64_t k = src[i];
-        int64_t d = (int64_t)((k >> shift) & 255);
-        dst[pos[d]++] = k;
+/* One stable counting pass on the 8-bit digit at shift; with back, the
+   source is read from its end. The first half of the keys (in reading
+   order) fill each bucket from its start and the second half (in reverse)
+   from its end, so two chains of bucket counters run in parallel (one
+   chain stalls on keys with the same digit, which the top digits often
+   have). pos holds the start of each bucket. */
+static void radix_pass(const uint64_t *src, int64_t n, uint64_t *dst, const uint32_t *pos, int shift, bool back) {
+    uint32_t lo[256], hi[256];
+    memcpy(lo, pos, sizeof lo);
+    memcpy(hi, pos + 1, 255 * sizeof *hi);
+    hi[255] = (uint32_t)n;
+    int64_t h = n / 2;
+    /* key t of the reading order is src[a + t * st] */
+    int64_t a = back ? n - 1 : 0, st = back ? -1 : 1;
+    const uint64_t *f = src + a, *r = src + a + (n - 1) * st;
+    for (int64_t t = 0; t < h; t++) {
+        uint64_t k0 = f[t * st], k1 = r[-t * st];
+        dst[lo[(k0 >> shift) & 255]++] = k0;
+        dst[--hi[(k1 >> shift) & 255]] = k1;
     }
-}
-
-/* One stable counting pass on the 8-bit digit at shift. */
-static void radix_pass(const uint64_t *src, int64_t n, uint64_t *dst, uint32_t *pos, int shift) {
-    for (int64_t i = 0; i < n; i++) {
-        uint64_t k = src[i];
-        int64_t d = (int64_t)((k >> shift) & 255);
-        dst[pos[d]++] = k;
+    if (n & 1) {
+        uint64_t k = f[h * st];
+        dst[lo[(k >> shift) & 255]] = k;
     }
 }
 
@@ -392,17 +400,17 @@ static int keysort_blocks(uint64_t *a, int64_t n, uint64_t *tmp, uint64_t *bh, u
     for (int d = 0; d < 4; d++) {
         uint32_t dig = (hk0 >> (8 * d)) & 255;
         if (h[256 * d + dig] == n) continue;
-        uint32_t *cnt = pos + 256 * d;
+        const uint32_t *cnt = pos + 256 * d;
         int shift = 32 + 8 * d;
         if (at == 0) {
             /* backwards: equal high parts end in ascending ~index order */
-            radix_pass_back(a, n, rk, cnt, shift);
+            radix_pass(a, n, rk, cnt, shift, true);
             at = 1;
         } else if (at == 1) {
-            radix_pass(rk, n, tmp, cnt, shift);
+            radix_pass(rk, n, tmp, cnt, shift, false);
             at = 2;
         } else {
-            radix_pass(tmp, n, rk, cnt, shift);
+            radix_pass(tmp, n, rk, cnt, shift, false);
             at = 1;
         }
     }
