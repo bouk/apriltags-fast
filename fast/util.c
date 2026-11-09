@@ -9,23 +9,27 @@
    As the Goose runtime does, the first 2 MB of each stack get no
    transparent huge page: most stacks hold a few bytes, which a huge
    page would commit 2 MB for. */
-void at_ctx_init(at_ctx *cx) {
+void at_ctx_init(at_ctx *cx, int n, size_t need) {
     /* Where the address space is limited (valgrind, ulimit -v), reserve
-       less: halve the stacks until the mapping succeeds. */
-    size_t reserve = AT_STACK_RESERVE;
+       less: halve the stacks until the mapping succeeds, but not below
+       what the image needs. */
+    need = (need + AT_STACK_GAP - 1) & ~(AT_STACK_GAP - 1);
+    size_t reserve = need > AT_STACK_RESERVE_MIN ? need : AT_STACK_RESERVE_MIN;
+    size_t floor = need < ((size_t)64 << 20) ? (size_t)64 << 20 : need;
+    if (floor > reserve) floor = reserve;
     void *p = MAP_FAILED;
-    for (; reserve >= ((size_t)64 << 20); reserve /= 2) {
-        p = mmap(NULL, AT_NSTACKS * (reserve + AT_STACK_GAP), PROT_READ | PROT_WRITE,
+    for (; reserve >= floor; reserve /= 2) {
+        p = mmap(NULL, (size_t)n * (reserve + AT_STACK_GAP), PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p != MAP_FAILED) break;
     }
     if (p == MAP_FAILED) {
-        fprintf(stderr, "apriltag: cannot reserve data stacks\n");
+        fprintf(stderr, "apriltag: cannot reserve %d data stacks of %zu MB\n", n, floor >> 20);
         abort();
     }
     size_t span = reserve + AT_STACK_GAP;
     uint8_t *r = (uint8_t *)p;
-    for (int k = 0; k < AT_NSTACKS; k++) {
+    for (int k = 0; k < n; k++) {
         uint8_t *s = r + (size_t)k * span;
         if (mprotect(s + reserve, AT_STACK_GAP, PROT_NONE)) abort();
 #ifdef MADV_NOHUGEPAGE
@@ -34,13 +38,21 @@ void at_ctx_init(at_ctx *cx) {
     }
     cx->region = r;
     cx->span = span;
+    cx->n = n;
     cx->sp = 1;
     cx->bump = r;
 }
 
 void at_ctx_release(at_ctx *cx) {
-    if (cx->region) munmap(cx->region, AT_NSTACKS * cx->span);
+    if (cx->region) munmap(cx->region, (size_t)cx->n * cx->span);
     cx->region = NULL;
+}
+
+bool at_ctx_fit(at_ctx *cx, int n, size_t reserve) {
+    if (cx->region && cx->n >= n && cx->span - AT_STACK_GAP >= reserve) return false;
+    at_ctx_release(cx);
+    at_ctx_init(cx, n, reserve);
+    return true;
 }
 
 double at_clock(void) {

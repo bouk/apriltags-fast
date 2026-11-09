@@ -78,6 +78,7 @@ struct at_pool {
     pthread_t threads[AT_MAX_WORKERS];
     int32_t nworkers;
     int32_t started; /* atomic: threads created */
+    size_t wreserve; /* the stack reserve the workers need for this image */
     uint32_t job_epoch;
     /* the stage: its kind and job, set before its jobs are posted */
     int kind;
@@ -196,7 +197,7 @@ static void *worker_main(void *arg) {
     int32_t a = (n + 1) / 2;
     start_workers(p, lo + 1, lo + 1 + a);
     start_workers(p, lo + 1 + a, hi);
-    at_ctx_init(&wk->cx);
+    at_ctx_init(&wk->cx, AT_WORKER_NSTACKS, p->wreserve);
     for (;;) {
         uint32_t wv = __atomic_load_n(&wk->word, __ATOMIC_ACQUIRE);
         if ((wv & 3) == ST_POSTED) {
@@ -207,6 +208,7 @@ static void *worker_main(void *arg) {
                     break;
                 }
                 wake_part(p, wk->index, wk->sub_hi);
+                at_ctx_fit(&wk->cx, AT_WORKER_NSTACKS, p->wreserve);
                 run_stage(p, &wk->cx);
                 __atomic_store_n(&wk->word, (wv & ~3u) | ST_DONE, __ATOMIC_RELEASE);
             }
@@ -275,20 +277,23 @@ static void pool_stop(struct at_internal *in) {
    shrinks: idle workers sleep. This thread starts POST_FAN workers and
    does not wait for them: jobs posted before a worker runs wait in its
    slot, and the calling thread cancels them if it got there first. */
-static void pool_ensure(struct at_internal *in, int64_t nthreads) {
+static void pool_ensure(struct at_internal *in, int64_t nthreads, size_t wreserve) {
     struct at_pool *p = in->pool;
     if (!p) {
         p = (struct at_pool *)aligned_alloc(64, (sizeof(struct at_pool) + 63) / 64 * 64);
         if (!p) abort();
         memset(p, 0, sizeof *p);
-        p->runs = STK_TAKE(&in->dcx, Run);
-        p->clpts = STK_TAKE(&in->dcx, Pt);
-        p->clids = STK_TAKE(&in->dcx, uint64_t);
-        p->clcounts = STK_TAKE(&in->dcx, uint32_t);
-        p->join = STK_TAKE(&in->dcx, uint32_t);
-        p->troot = STK_TAKE(&in->dcx, uint32_t);
         in->pool = p;
     }
+    /* the image arrays of the stages, after those of the detector on the
+       image stacks (taken again for each image) */
+    p->runs = STK_TAKE(&in->icx, Run);
+    p->clpts = STK_TAKE(&in->icx, Pt);
+    p->clids = STK_TAKE(&in->icx, uint64_t);
+    p->clcounts = STK_TAKE(&in->icx, uint32_t);
+    p->join = STK_TAKE(&in->icx, uint32_t);
+    p->troot = STK_TAKE(&in->icx, uint32_t);
+    p->wreserve = wreserve;
     int32_t want = (int32_t)imin(nthreads - 1, AT_MAX_WORKERS);
     if (p->nworkers >= want) return;
     /* new workers' slots; the threads of an old range are all started

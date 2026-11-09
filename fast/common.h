@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "apriltag_fast.h"
 
@@ -114,7 +117,7 @@ static inline int at_simd_level_named(const char *name) {
 
 /* ---------------------------------------------------------------------
    Data stacks, as in the Goose runtime. Each thread has a context with
-   AT_NSTACKS stacks. A stack is a region of AT_STACK_RESERVE bytes of
+   a fixed number of stacks. A stack is a region of `reserve` bytes of
    address space (mmap, MAP_NORESERVE), followed by an unmapped gap of
    AT_STACK_GAP bytes: the OS commits a page when it is first touched,
    and the pages stay mapped, so later frames reuse them warm. Runaway
@@ -129,14 +132,35 @@ static inline int at_simd_level_named(const char *name) {
    - stk_enter and stk_leave bracket a scope: leave frees all stacks
      taken and all scratch bumped since the enter (a watermark).
    No memory is freed to the OS while the context lives. */
-#define AT_NSTACKS 48
-#define AT_STACK_RESERVE ((size_t)2048 << 20)
 #define AT_STACK_GAP ((size_t)1 << 20)
-#define AT_STACK_SPAN (AT_STACK_RESERVE + AT_STACK_GAP)
+/* The smallest reserve of a stack. Linux and macOS give a process
+   terabytes of address space, so a stack gets 2 GB whatever the image.
+   iOS gives tens of GB (with the extended virtual addressing
+   entitlement), so there a stack gets what the image needs (below). */
+#if defined(AT_STACK_RESERVE_MIN)
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+#define AT_STACK_RESERVE_MIN ((size_t)16 << 20)
+#else
+#define AT_STACK_RESERVE_MIN ((size_t)2048 << 20)
+#endif
+/* The stacks of each context, and the bytes a stack can need for each
+   pixel of the quad image (measured at most 31, 7.1 and 0.6, on noise
+   images of 48 MP), with a margin. The image context holds the image
+   arrays of the detector (9 stacks); the matching context is the
+   scratch of the calling thread. */
+#define AT_DETECTOR_NSTACKS 8 /* the decode tables and the detections */
+#define AT_DETECTOR_RESERVE ((size_t)256 << 20)
+#define AT_IMAGE_NSTACKS 10
+#define AT_IMAGE_BYTES_PER_PIXEL 40
+#define AT_MATCH_NSTACKS 20
+#define AT_MATCH_BYTES_PER_PIXEL 10
+#define AT_WORKER_NSTACKS 8
+#define AT_WORKER_BYTES_PER_PIXEL 2
 
 typedef struct at_ctx {
     uint8_t *region; /* stack k starts at region + k * span */
-    size_t span;     /* AT_STACK_SPAN, or less where the OS gives less */
+    size_t span;     /* the reserve and the gap of a stack */
+    int n;           /* the number of stacks */
     int sp;          /* the next free stack (stack 0 is the bump stack) */
     uint8_t *bump;   /* the top of stack 0 */
 } at_ctx;
@@ -148,8 +172,11 @@ typedef struct {
 
 /* A context with its stacks reserved (abort if the OS refuses), and its
    release. */
-void at_ctx_init(at_ctx *cx);
+void at_ctx_init(at_ctx *cx, int n, size_t reserve);
 void at_ctx_release(at_ctx *cx);
+/* Reserve the stacks again if they are smaller than reserve (or the
+   minimum); return true if it did. The context must hold no data. */
+bool at_ctx_fit(at_ctx *cx, int n, size_t reserve);
 
 AT_INLINE at_mark stk_enter(const at_ctx *cx) { return (at_mark){cx->sp, cx->bump}; }
 AT_INLINE void stk_leave(at_ctx *cx, at_mark m) {
@@ -158,7 +185,10 @@ AT_INLINE void stk_leave(at_ctx *cx, at_mark m) {
 }
 
 AT_INLINE void *stk_take_(at_ctx *cx) {
-    if (AT_UNLIKELY(cx->sp >= AT_NSTACKS)) abort();
+    if (AT_UNLIKELY(cx->sp >= cx->n)) {
+        fprintf(stderr, "apriltag: out of data stacks\n");
+        abort();
+    }
     return cx->region + (size_t)cx->sp++ * cx->span;
 }
 
@@ -324,6 +354,9 @@ struct at_internal {
     uint8_t *buf_qim;
     uint8_t *buf_t;
     UfNode *buf_uf;
+    /* the stacks of the image arrays (above and those of the pool), sized
+       for the largest image so far */
+    at_ctx icx;
     /* the scratch stacks of the calling thread */
     at_ctx mcx;
     struct at_pool *pool;

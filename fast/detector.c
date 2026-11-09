@@ -20,15 +20,12 @@ at_detector *at_detector_create(void) {
     td->qtp.deglitch = false;
     td->in = in;
     /* the detector's arrays keep their stacks while it lives */
-    at_ctx_init(&in->dcx);
+    at_ctx_init(&in->dcx, AT_DETECTOR_NSTACKS, AT_DETECTOR_RESERVE);
     svec_take(&in->dcx, in->qd_offsets);
     svec_take(&in->dcx, in->qd_ids);
     svec_take(&in->dcx, in->qd_codes);
     svec_take(&in->dcx, in->dets);
-    in->buf_qim = STK_TAKE(&in->dcx, uint8_t);
-    in->buf_t = STK_TAKE(&in->dcx, uint8_t);
-    in->buf_uf = STK_TAKE(&in->dcx, UfNode);
-    at_ctx_init(&in->mcx);
+    at_ctx_init(&in->mcx, AT_MATCH_NSTACKS, 0);
     qsm_kernel_init();
     return td;
 }
@@ -40,6 +37,7 @@ void at_detector_destroy(at_detector *td) {
     pool_stop(td->in);
     at_ctx_release(&td->in->dcx);
     at_ctx_release(&td->in->mcx);
+    at_ctx_release(&td->in->icx);
     free(td->in);
     free(td);
 }
@@ -257,13 +255,21 @@ void at_detect(at_detector *td, const uint8_t *pixels, int64_t width, int64_t he
     if (width < 8 || height < 8) return;
     int64_t nthreads = imax(1, td->nthreads);
     double t_start = at_clock();
-    if (nthreads > 1) pool_ensure(in, nthreads);
-    bool pooled = nthreads > 1 && in->pool != NULL;
-    at_mark mk = stk_enter(cx);
-
     /* the quad detection image: decimated, and blurred or sharpened */
     int64_t qw = width, qh = height;
     if (td->quad_decimate > 1.0f) decimated_size(width, height, td->quad_decimate, &qw, &qh);
+    /* the stacks, sized for this image (the image arrays hold nothing
+       between calls) */
+    size_t qpx = (size_t)(qw + 2) * (size_t)(qh + 2);
+    at_ctx_fit(&in->mcx, AT_MATCH_NSTACKS, qpx * AT_MATCH_BYTES_PER_PIXEL);
+    at_ctx_fit(&in->icx, AT_IMAGE_NSTACKS, qpx * AT_IMAGE_BYTES_PER_PIXEL);
+    in->icx.sp = 1;
+    in->buf_qim = STK_TAKE(&in->icx, uint8_t);
+    in->buf_t = STK_TAKE(&in->icx, uint8_t);
+    in->buf_uf = STK_TAKE(&in->icx, UfNode);
+    if (nthreads > 1) pool_ensure(in, nthreads, qpx * AT_WORKER_BYTES_PER_PIXEL);
+    bool pooled = nthreads > 1 && in->pool != NULL;
+    at_mark mk = stk_enter(cx);
     uint8_t *qim = in->buf_qim;
     /* with the pool, the threshold jobs decimate by 2 themselves (when
        nothing else changes the decimated image first) */
