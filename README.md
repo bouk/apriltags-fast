@@ -234,6 +234,17 @@ for these measured reasons:
 - A command buffer starts 0.1 to 1.3 ms after the commit (0.35 ms on the
   phone).
 
+A third design was measured as a prototype and not kept: the GPU owns
+the last part of the image from the start of the image (threshold, labels
+and clusters), and the CPU does those stages for the rows before it only.
+On the phone, with 10% of the image on the GPU: union-find 1.28 to 1.17
+ms and clusters 2.46 to 2.37 ms, but threshold 0.56 to 0.61 ms and fit
+4.10 to 4.19 ms (the fit then reads data that the GPU made, which is not
+in the caches of the CPU). Total 8.43 to 8.38 ms, less than the noise.
+With 18% the CPU waits for the GPU (8.49 to 8.77 ms). The exact order of
+the clusters also needs the union-find of the whole image, so this design
+can only keep the output bit-identical when all tag ids are different.
+
 Debug variables: `APRILTAG_GPU_PROF=1` (the GPU time of each kernel),
 `APRILTAG_GPU_TRACE=1` (the timing of the region and of the band tasks),
 `APRILTAG_GPU_FORCE=<part>` (tests: with threads, the GPU gets this part
