@@ -46,6 +46,7 @@ struct P {
     uint full;    /* 1: count the points and the entries of each slot, and list the slots */
 };
 constant uint SEG = 64;
+constant uint SHARDS = 64;
 
 kernel void k_copy(constant P &p [[buffer(0)]], device const uchar *src [[buffer(1)]],
                    device uchar *qim [[buffer(2)]], uint2 gg [[thread_position_in_grid]]) {
@@ -341,8 +342,10 @@ static uint slot_of(device atomic_uint *ka, device atomic_uint *kb, device atomi
                 if (atomic_compare_exchange_weak_explicit(&kb[s], &e, b + 1, memory_order_relaxed,
                                                           memory_order_relaxed)) {
                     eb = b + 1;
-                    uint k = atomic_fetch_add_explicit(&state[2], 1, memory_order_relaxed);
-                    if (full && k <= tmask) slots[k] = s;
+                    if (full) {
+                        uint k = atomic_fetch_add_explicit(&state[2], 1, memory_order_relaxed);
+                        if (k <= tmask) slots[k] = s;
+                    }
                 } else {
                     eb = e;
                 }
@@ -389,12 +392,19 @@ kernel void k_emit(constant P &p [[buffer(0)]], device const uchar *t [[buffer(1
     uint n = 0;
     for (uint k = 0; k < SEG / 4; k++) n += popcount(mask[mbase + k] & 0x0f0f0f0fu);
     if (n == 0) return;
-    uint at = atomic_fetch_add_explicit(&state[0], n, memory_order_relaxed);
-    uint ea = atomic_fetch_add_explicit(&state[3], n, memory_order_relaxed);
-    if (at + n > p.cap || ea + n > p.cap) {
+    /* The space for the points and the entries: one of SHARDS parts of
+       the buffers, each with a counter of its own (one counter for all
+       threads makes them wait for each other). The entries of a segment
+       are at the index of its first point. */
+    uint sh = (y * p.nseg + g.x) % SHARDS;
+    uint scap = p.cap / SHARDS;
+    uint at = atomic_fetch_add_explicit(&state[16 + 16 * sh], n, memory_order_relaxed);
+    if (at + n > scap) {
         atomic_store_explicit(&state[1], 1, memory_order_relaxed);
         return;
     }
+    at += sh * scap;
+    uint ea = at;
     seginfo[si] = ea;
     const uint dxy[4] = {1u, 65536u, 65535u, 65537u};
     /* gx | gy << 16 for neighbor j and pixel value a (0 or 255), at
@@ -448,11 +458,100 @@ kernel void k_emit(constant P &p [[buffer(0)]], device const uchar *t [[buffer(1
     entries[ea] = uint2(lat, lslot | (lflag << 23) | ((lcnt - 1) << 24));
     seginfo[si + 1] = ea + 1 - ea0;
 }
+
+/* The two kernels below do the work of k_emit for a region, with even
+   work for each thread (k_emit has one long loop for each segment, and
+   the GPU then waits for the longest ones). The points get no entries:
+   pslot has the slot and the flag of each point, and the CPU finds the
+   runs.
+
+   k_alloc, a thread a segment: the space for the points of the segment
+   (seginfo: the first point and the count), and for each pixel the
+   number of points of the segment before it (poff). */
+kernel void k_alloc(constant P &p [[buffer(0)]], device const uint *mask [[buffer(1)]],
+                    device atomic_uint *state [[buffer(2)]], device uint *seginfo [[buffer(3)]],
+                    device uchar *poff [[buffer(4)]], uint2 gg [[thread_position_in_grid]]) {
+    uint2 g = uint2(gg.x, gg.y + p.ya);
+    uint x0 = g.x * SEG;
+    uint y = g.y;
+    if (y >= p.yb || x0 >= p.w) return;
+    uint si = 2 * (y * p.nseg + g.x);
+    uint mbase = (y * p.nseg + g.x) * (SEG / 4);
+    uint n = 0;
+    for (uint k = 0; k < SEG / 4; k++) {
+        uint mw = mask[mbase + k] & 0x0f0f0f0fu;
+        uint b = y * p.w + x0 + 4 * k;
+        if (x0 + 4 * k + 3 < p.w) {
+            poff[b] = uchar(n);
+            poff[b + 1] = uchar(n + popcount(mw & 0xffu));
+            poff[b + 2] = uchar(n + popcount(mw & 0xffffu));
+            poff[b + 3] = uchar(n + popcount(mw & 0xffffffu));
+        } else {
+            for (uint q = 0; q < 4 && x0 + 4 * k + q < p.w; q++) poff[b + q] = uchar(n + popcount(mw & ((1u << (8 * q)) - 1u)));
+        }
+        n += popcount(mw);
+    }
+    uint at = 0;
+    if (n != 0) {
+        uint sh = (y * p.nseg + g.x) % SHARDS;
+        uint scap = p.cap / SHARDS;
+        at = atomic_fetch_add_explicit(&state[16 + 16 * sh], n, memory_order_relaxed);
+        if (at + n > scap) {
+            atomic_store_explicit(&state[1], 1, memory_order_relaxed);
+            n = 0;
+        }
+        at += sh * scap;
+    }
+    seginfo[si] = at;
+    seginfo[si + 1] = n;
+}
+
+/* k_points, a thread a pixel: the points of the pixel. */
+kernel void k_points(constant P &p [[buffer(0)]], device const uchar *t [[buffer(1)]],
+                     device const uint *lab [[buffer(2)]], device const uchar *mask [[buffer(3)]],
+                     device atomic_uint *ka [[buffer(4)]], device atomic_uint *kb [[buffer(5)]],
+                     device atomic_uint *state [[buffer(6)]], device uint *slots [[buffer(7)]],
+                     device uint2 *pts [[buffer(8)]], device uint *pslot [[buffer(9)]],
+                     device const uint *seginfo [[buffer(10)]], device const uchar *soff [[buffer(11)]],
+                     device const uchar *poff [[buffer(12)]], uint2 gg [[thread_position_in_grid]]) {
+    uint2 g = uint2(gg.x, gg.y + p.ya);
+    uint x = g.x, y = g.y;
+    if (y >= p.yb || x >= p.w) return;
+    uint m = mask[y * p.nseg * SEG + x];
+    if ((m & 15u) == 0) return;
+    uint si = 2 * (y * p.nseg + x / SEG);
+    if (seginfo[si + 1] == 0) return;
+    uint i = y * p.w + x;
+    uint at = seginfo[si] + poff[i];
+    const uint offs[4] = {1u, p.w, p.w - 1u, p.w + 1u};
+    const uint dxy[4] = {1u, 65536u, 65535u, 65537u};
+    const uint gtab[8] = {0x000000ffu, 0x0000ff01u, 0x00ff0000u, 0xff010000u,
+                          0x00ffff01u, 0xff0100ffu, 0x00ff00ffu, 0xff01ff01u};
+    uint r0 = lab[i - soff[i]];
+    uint a = t[i] & 1u;
+    uint xy = ((2 * y) << 16) + 2 * x;
+    uint la = 0xffffffffu, lb = 0xffffffffu, lslot = 0;
+    for (uint j = 0; j < 4; j++) {
+        if ((m & (1u << j)) == 0) continue;
+        uint k = i + offs[j];
+        uint r1 = lab[k - soff[k]];
+        uint ia = min(r0, r1), ib = max(r0, r1);
+        if (ia != la || ib != lb) {
+            lslot = slot_of(ka, kb, state, slots, ia, ib, p.tmask, false);
+            la = ia;
+            lb = ib;
+        }
+        uint flag = (j == 2 && (m & 16u) != 0) ? 1u : 0u;
+        pts[at] = uint2(xy + dxy[j], gtab[(j << 1) | a]);
+        pslot[at] = lslot | (flag << 23);
+        at++;
+    }
+}
 );
 
-enum { K_COPY, K_DEC2, K_TILE, K_TTHR, K_THRESH, K_ROWS, K_UNION, K_LABEL, K_OK, K_MASK, K_EMIT, K_COUNT };
+enum { K_COPY, K_DEC2, K_TILE, K_TTHR, K_THRESH, K_ROWS, K_UNION, K_LABEL, K_OK, K_MASK, K_EMIT, K_ALLOC, K_POINTS, K_COUNT };
 static const char *const kernel_names[K_COUNT] = {"k_copy", "k_dec2",  "k_tile", "k_tthr", "k_thresh", "k_rows",
-                                                  "k_union", "k_label", "k_ok",   "k_mask", "k_emit"};
+                                                  "k_union", "k_label", "k_ok",   "k_mask", "k_emit", "k_alloc", "k_points"};
 
 typedef struct {
     uint32_t w, h, sstride, soff;
@@ -558,7 +657,8 @@ static bool fit_buffers(ATMetal *m, int64_t w, int64_t h) {
     m->kb = new_buffer(m, 4 * ts);
     m->cnt = new_buffer(m, 4 * ts);
     m->slots = new_buffer(m, 4 * ts);
-    m->state = new_buffer(m, 16);
+    /* 16 words, then a counter for each of the 64 shards, 16 words apart */
+    m->state = new_buffer(m, 4 * (16 + 16 * 64));
     /* 3 points more: gather_points reads past a segment */
     m->pts = new_buffer(m, 8 * (m->cap + 3));
     m->entries = new_buffer(m, 8 * m->cap);
@@ -696,7 +796,7 @@ bool at_metal_submit(at_metal *mm, const uint8_t *pixels, const at_metal_params 
         };
         m->ya = ya;
         m->yb = yb;
-        memset(m->state.contents, 0, 16);
+        memset(m->state.contents, 0, 4 * (16 + 16 * 64));
 
         id<MTLCommandBuffer> cb = [m->queue commandBufferWithUnretainedReferences];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -761,12 +861,25 @@ bool at_metal_submit(at_metal *mm, const uint8_t *pixels, const at_metal_params 
         set_buffers(enc, @[m->t, m->okb, m->mask]);
         run2d(enc, m->pso[K_MASK], w, nr - 1);
         STEP();
-        set_buffers(enc, @[
-            m->t, m->parent, m->mask, m->ka, m->kb, m->cnt, m->ecnt, m->state, m->slots, m->pts, m->entries,
-            m->seginfo, m->soff
-        ]);
-        run2d(enc, m->pso[K_EMIT], m->nseg, nr - 1);
-        STEP();
+        if (full) {
+            set_buffers(enc, @[
+                m->t, m->parent, m->mask, m->ka, m->kb, m->cnt, m->ecnt, m->state, m->slots, m->pts, m->entries,
+                m->seginfo, m->soff
+            ]);
+            run2d(enc, m->pso[K_EMIT], m->nseg, nr - 1);
+            STEP();
+        } else {
+            /* okb is free after k_mask: it holds the point offsets */
+            set_buffers(enc, @[m->mask, m->state, m->seginfo, m->okb]);
+            run2d(enc, m->pso[K_ALLOC], m->nseg, nr - 1);
+            STEP();
+            set_buffers(enc, @[
+                m->t, m->parent, m->mask, m->ka, m->kb, m->state, m->slots, m->pts, m->entries, m->seginfo, m->soff,
+                m->okb
+            ]);
+            run2d(enc, m->pso[K_POINTS], w, nr - 1);
+            STEP();
+        }
 #undef STEP
         [enc endEncoding];
         atomic_store(&mm->state, 1);
@@ -789,13 +902,16 @@ bool at_metal_get(at_metal *mm, at_metal_out *out) {
         if (atomic_load(&mm->state) != 2) return false;
         const uint32_t *state = (const uint32_t *)m->state.contents;
         if (state[1] != 0 || state[2] > (uint32_t)m->ts_now / 2) return false;
+        uint32_t npoints = 0;
+        for (int k = 0; k < 64; k++) npoints += state[16 + 16 * k];
         out->w = m->w;
         out->h = m->h;
         out->y0 = m->ya;
         out->y1 = m->yb;
         out->pts = (const uint64_t *)m->pts.contents;
         out->entries = (const uint32_t *)m->entries.contents;
-        out->nentries = state[3];
+        out->pslot = m->ya == 0 ? NULL : (const uint32_t *)m->entries.contents;
+        out->nentries = npoints;
         out->ecounts = (const uint32_t *)m->ecnt.contents;
         out->seginfo = (const uint32_t *)m->seginfo.contents;
         out->nseg = m->nseg;
@@ -804,7 +920,7 @@ bool at_metal_get(at_metal *mm, at_metal_out *out) {
         out->counts = (const uint32_t *)m->cnt.contents;
         out->slots = (const uint32_t *)m->slots.contents;
         out->nslots = state[2];
-        out->npoints = state[0];
+        out->npoints = npoints;
         out->table_size = m->ts_now;
         id<MTLCommandBuffer> cb = m->pending;
         double gs = cb ? cb.GPUStartTime : m->gpu_start, ge = cb ? cb.GPUEndTime : m->gpu_end;

@@ -95,10 +95,18 @@ static int64_t gpu_band_scan(at_ctx *cx, ClusterTable *ct, const at_metal_out *g
     for (int64_t y = y0; y < y0 + n; y++) {
         const uint32_t *si = g->seginfo + 2 * y * g->nseg;
         for (int64_t sg = 0; sg < g->nseg; sg++, si += 2) {
-            const uint32_t *e = g->entries + 2 * (int64_t)si[0];
-            for (uint32_t i = 0; i < si[1]; i++, e += 2) {
-                uint32_t slot = e[1] & 0x7fffffu;
-                uint32_t c = (e[1] >> 24) + 1;
+            const uint32_t *ps = g->pslot + si[0];
+            uint32_t np = si[1];
+            for (uint32_t i = 0; i < np;) {
+                /* a run of points of one slot (a flagged point is alone) */
+                uint32_t pv = ps[i];
+                uint32_t first = si[0] + i;
+                uint32_t c = 1;
+                if (!(pv & 0x800000u))
+                    while (i + c < np && ps[i + c] == pv) c++;
+                i += c;
+                uint32_t e[2] = {first, pv};
+                uint32_t slot = pv & 0x7fffffu;
                 uint32_t hsh = (slot * 2654435761u) >> 21;
                 if (sc_slot[hsh] != slot) {
                     uint32_t ra = label_root(uf, rr, w, vcol_base, g->key_a[slot] - 1);

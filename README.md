@@ -219,12 +219,15 @@ for these measured reasons:
 
 - The GPU can only take the cluster stage (25 to 30% of an image): Apple
   GPUs have no 64-bit floats.
-- The chip shares its power and memory between the CPU and the GPU. The
-  GPU gets about 3 times slower while all CPU cores work: alone it does
-  the stage of a 6.8 MP image in 4.3 ms, with the threads at work it does
-  a quarter of the image in 3.7 ms. And what the GPU takes from the
-  cluster stage (2.45 to 2.35 ms on the phone), the fit stage loses (4.1
-  to 4.2 ms). The phone is also not faster with 8 threads than with 6.
+- With the 8 threads at work, the GPU needs 0.45 ms and then 2.0 ms for
+  each megapixel of its region (measured on the phone for regions of 7%
+  and 22% of a 6.8 MP image). The 8 threads do the cluster stage at 0.36
+  ms for each megapixel. So the GPU can add at most 1/6 to the speed of
+  the stage, and it gets 14 to 17% of the bands.
+- The chip shares its power and memory between the CPU and the GPU: with
+  the GPU at work the other stages get a little slower (threshold 0.56
+  to 0.59 ms, union-find 1.30 to 1.34 ms, fit 4.10 to 4.15 ms), which
+  takes back what the cluster stage gains (2.48 to 2.39 ms).
 - A band whose points come from the GPU still costs the CPU half of a
   band that it makes itself: most of the stage is the cluster tables and
   the copy of the points, not the pixel work.

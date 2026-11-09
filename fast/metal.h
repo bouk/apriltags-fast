@@ -48,6 +48,11 @@ typedef struct {
        order give the emission order of the image. */
     const uint64_t *pts;
     const uint32_t *entries;
+    /* A region (y0 > 0) has no entries: seginfo[2i] is then the first
+       point of the segment and seginfo[2i + 1] its number of points,
+       and pslot has the slot (23 low bits) and the flag (bit 23) of
+       each point. NULL for all rows. */
+    const uint32_t *pslot;
     const uint32_t *seginfo;
     int64_t nseg, nentries;
     /* the cluster table: slot s is the pair of component labels key_a[s]
