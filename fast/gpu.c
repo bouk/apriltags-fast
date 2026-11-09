@@ -70,31 +70,28 @@ AT_INLINE bool root_ok(const UfNode *uf, uint32_t root, int64_t min_px) {
     return (int64_t)uf[root].size + 1 >= min_px;
 }
 
-/* The boundary points of rows y0..y0+n-1 from the GPU stage into the
-   table, as emit_row gives them: in emission order, in segments of one
-   cluster. The GPU labeled its region on its own, so it could not know
-   the size of each component: the entries of clusters with a component
-   that is too small are left out here, and each flagged entry is tested
-   (see k_mask of metal.m). */
-static void gpu_band_points(at_ctx *cx, ClusterTable *ct, const at_metal_out *g, RunRows rr, const UfNode *uf,
-                            int64_t vcol_base, int64_t min_px, int64_t y0, int64_t n) {
+/* The clusters of rows y0..y0+n-1 from the GPU stage into the table
+   (ids and counts), and the entries to keep into ct->segs, in emission
+   order: the first point in the GPU's points (32 bits), the count (9
+   bits), the slot in the table (from bit 41). The GPU labeled its
+   region on its own, so it could not know the size of each component:
+   the entries of clusters with a component that is too small are left
+   out here, and each flagged entry is tested (see k_mask of metal.m).
+   Returns the number of points. */
+static int64_t gpu_band_scan(at_ctx *cx, ClusterTable *ct, const at_metal_out *g, RunRows rr, const UfNode *uf,
+                             int64_t vcol_base, int64_t min_px, int64_t y0, int64_t n) {
     int64_t w = g->w;
     at_mark mk = stk_enter(cx);
-    /* the cluster id of each slot (0: a component is too small), in a
-       small cache */
+    /* the table slot of each GPU slot (-1: a component is too small), in
+       a small cache */
     enum { SC = 2048 };
     uint32_t *sc_slot = STK_ALLOC(cx, uint32_t, SC);
-    uint64_t *sc_id = STK_ALLOC(cx, uint64_t, SC);
+    int32_t *sc_li = STK_ALLOC(cx, int32_t, SC);
     memset(sc_slot, 0xff, SC * 4);
     const Pt *gpts = (const Pt *)g->pts;
-    Pt *pts = ct->pts.data;
-    int64_t np = ct->pts.len;
     uint64_t *segs = ct->segs.data;
     int64_t ns = ct->segs.len;
-    uint32_t *counts = ct->counts.data;
-    uint64_t lid = 0;
-    int64_t lslot = -1;
-    uint32_t lcnt = 0;
+    int64_t total = 0;
     for (int64_t y = y0; y < y0 + n; y++) {
         const uint32_t *si = g->seginfo + 2 * y * g->nseg;
         for (int64_t sg = 0; sg < g->nseg; sg++, si += 2) {
@@ -108,10 +105,10 @@ static void gpu_band_points(at_ctx *cx, ClusterTable *ct, const at_metal_out *g,
                     uint32_t rb = label_root(uf, rr, w, vcol_base, g->key_b[slot] - 1);
                     uint64_t id = ra < rb ? ((uint64_t)rb << 32) + ra : ((uint64_t)ra << 32) + rb;
                     sc_slot[hsh] = slot;
-                    sc_id[hsh] = root_ok(uf, ra, min_px) && root_ok(uf, rb, min_px) ? id : 0;
+                    sc_li[hsh] = root_ok(uf, ra, min_px) && root_ok(uf, rb, min_px) ? (int32_t)cluster_find(ct, id) : -1;
                 }
-                uint64_t id = sc_id[hsh];
-                if (id == 0) continue;
+                int32_t li = sc_li[hsh];
+                if (li < 0) continue;
                 if (e[1] & 0x800000u) {
                     /* the (-1,1) point of pixel (x, py): not valid if the
                        pixel to the left has the (1,1) point of the pair */
@@ -121,29 +118,34 @@ static void gpu_band_points(at_ctx *cx, ClusterTable *ct, const at_metal_out *g,
                     uint32_t r2 = label_root(uf, rr, w, vcol_base, (uint32_t)((py + 1) * w + x));
                     if (root_ok(uf, r1, min_px) && root_ok(uf, r2, min_px)) continue;
                 }
-                if (id != lid || lslot < 0) {
-                    if (lcnt != 0) {
-                        counts[lslot] += lcnt;
-                        segs[ns++] = ((uint64_t)lslot << 32) | lcnt;
-                    }
-                    lcnt = 0;
-                    lslot = cluster_find(ct, id);
-                    counts = ct->counts.data;
-                    lid = id;
-                }
-                memcpy(pts + np, gpts + e[0], (size_t)c * sizeof(Pt));
-                np += c;
-                lcnt += c;
+                ct->counts.data[li] += c;
+                total += c;
+                segs[ns++] = (uint64_t)e[0] | ((uint64_t)c << 32) | ((uint64_t)li << 41);
             }
         }
     }
-    if (lcnt != 0) {
-        counts[lslot] += lcnt;
-        segs[ns++] = ((uint64_t)lslot << 32) | lcnt;
-    }
-    ct->pts.len = np;
     ct->segs.len = ns;
     stk_leave(cx, mk);
+    return total;
+}
+
+/* Put the points of the entries of gpu_band_scan at pos[slot] of out,
+   and move that position on (scatter_points for the GPU's points). With
+   pad, an entry of at most 4 points copies 4 points. */
+static void gpu_band_copy(const ClusterTable *ct, const at_metal_out *g, uint32_t *pos, Pt *out, bool pad) {
+    const Pt *gpts = (const Pt *)g->pts;
+    for (int64_t i = 0; i < ct->segs.len; i++) {
+        uint64_t sg = ct->segs.data[i];
+        uint32_t src = (uint32_t)sg;
+        int64_t c = (int64_t)((sg >> 32) & 0x1ff);
+        int64_t li = (int64_t)(sg >> 41);
+        int64_t p = pos[li];
+        if (pad && c <= 4)
+            memcpy(out + p, gpts + src, 4 * sizeof(Pt));
+        else
+            memcpy(out + p, gpts + src, (size_t)c * sizeof(Pt));
+        pos[li] = (uint32_t)(p + c);
+    }
 }
 
 /* The clusters of the GPU stage, in the order of cluster_order for
@@ -292,17 +294,27 @@ static bool gpu_submit(at_detector *td, const uint8_t *pixels, int64_t width, in
    first. If the GPU was not even done at the end of the image, the
    detector had to wait for it: the next images then go without the GPU
    (twice as many each time). */
-static void gpu_submit_region(at_detector *td, const uint8_t *pixels, int64_t width, int64_t height, int64_t stride,
-                              int64_t qh, int64_t nthreads, int64_t row_end) {
+static uint8_t *gpu_threshold_buffer(at_detector *td, int64_t qw, int64_t qh) {
     struct at_internal *in = td->in;
     in->gpu_pending = false;
+    in->gpu_t = false;
     /* AT_GPU_AUTO: with threads the GPU does not make an image faster
        (see README.md), so only AT_GPU_ON uses it */
-    if (in->gpu_mode != AT_GPU_ON) return;
+    if (!in->metal || in->gpu_mode != AT_GPU_ON || td->qtp.deglitch || td->debug) return NULL;
+    if (td->qtp.min_cluster_pixels < 2 || qh < 8) return NULL;
     if (in->gpu_skip > 0 && gpu_force() == 0.0) {
         in->gpu_skip--;
-        return;
+        return NULL;
     }
+    uint8_t *t = at_metal_threshold_buffer(in->metal, qw, qh);
+    in->gpu_t = t != NULL;
+    return t;
+}
+
+/* Start the GPU on the last bands, after the threshold stage. */
+static void gpu_submit_region(at_detector *td, int64_t qw, int64_t qh, int64_t nthreads, int64_t row_end) {
+    struct at_internal *in = td->in;
+    if (!in->gpu_t) return;
     if (in->gpu_frac <= 0.0) in->gpu_frac = 0.35;
     if (gpu_force() > 0.0) in->gpu_frac = gpu_force();
     /* the bands of clusters_fit_parallel */
@@ -313,7 +325,18 @@ static void gpu_submit_region(at_detector *td, const uint8_t *pixels, int64_t wi
     r = imax(1, imin(r, ntasks - 1));
     if (ntasks < 2) return;
     in->gpu_k0 = ntasks - r;
-    in->gpu_pending = gpu_submit(td, pixels, width, height, stride, row_end, 1 + in->gpu_k0 * chunk, qh - 1);
+    at_metal_params mp = {
+        .width = qw,
+        .height = qh,
+        .stride = qw,
+        .decimate = 1,
+        .min_white_black_diff = td->qtp.min_white_black_diff,
+        .min_cluster_pixels = td->qtp.min_cluster_pixels,
+        .row_end = row_end,
+        .y0 = 1 + in->gpu_k0 * chunk,
+        .y1 = qh - 1,
+    };
+    in->gpu_pending = at_metal_submit(in->metal, NULL, &mp);
 }
 
 /* The end of the cluster stage: `used` of the GPU's `bands` took its
@@ -329,30 +352,37 @@ static void gpu_region_result(at_detector *td, int64_t bands, int64_t used) {
     if (in->gpu_frac < 0.04) in->gpu_frac = 0.04;
 }
 
-/* The end of an image: wait for the GPU if it still works (it reads the
-   caller's image). */
+/* The end of an image. One thread: let go of the caller's image. With
+   the pool the GPU can still work (it reads only its own buffers): the
+   next image then goes without it. If no band took the GPU's points
+   though it has the smallest part, the next images go without the GPU
+   (twice as many each time). */
 static void gpu_finish(at_detector *td, bool pooled) {
     struct at_internal *in = td->in;
     if (!in->metal) return;
-    if (pooled && in->gpu_pending) {
-        if (!at_metal_done(in->metal)) {
-            in->gpu_backoff = in->gpu_backoff ? imin(2 * in->gpu_backoff, 256) : 2;
-            in->gpu_skip = in->gpu_backoff;
-        } else if (in->gpu_used) {
-            in->gpu_backoff = 0;
-        }
+    if (!pooled) {
+        at_metal_finish(in->metal);
+        in->gpu_pending = false;
+        return;
     }
-    at_metal_finish(in->metal);
+    if (!in->gpu_pending) return;
+    if (in->gpu_used) {
+        in->gpu_backoff = 0;
+    } else if (in->gpu_frac <= 0.05) {
+        in->gpu_backoff = in->gpu_backoff ? imin(2 * in->gpu_backoff, 256) : 2;
+        in->gpu_skip = in->gpu_backoff;
+    }
     at_metal_out g;
-    if (pooled && in->gpu_pending && at_metal_get(in->metal, &g)) {
+    if (at_metal_get(in->metal, &g)) {
         td->timing.gpu = g.gpu_seconds;
         static int trace = -1;
         if (trace < 0) trace = getenv("APRILTAG_GPU_TRACE") != NULL;
-        if (trace && (in->gpu_frames++ & 63) == 63)
+        if (trace && (in->gpu_frames & 63) == 63)
             fprintf(stderr, "region: rows %lld..%lld of %lld  submit %.3f  start %.3f  gpu %.3f  done at %.3f ms  share %.2f frac %.2f\n",
                     (long long)g.y0, (long long)g.y1, (long long)g.h, g.submit_seconds * 1e3, g.start_seconds * 1e3,
                     g.gpu_seconds * 1e3, g.done_seconds * 1e3, td->timing.gpu_share, in->gpu_frac);
     }
+    in->gpu_frames++;
     in->gpu_pending = false;
 }
 

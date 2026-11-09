@@ -299,14 +299,12 @@ void at_detect(at_detector *td, const uint8_t *pixels, int64_t width, int64_t he
 #if defined(AT_METAL)
     /* the GPU stage works from here on, until the clusters are needed */
     in->gpu_used = false;
-    if (in->metal && qh >= 8) {
-        if (pooled) {
-            int64_t *tasks = STK_ALLOC(cx, int64_t, 2 * unionfind_max_tasks(qh));
-            int64_t nt = unionfind_tasks(qh, nthreads, tasks);
-            gpu_submit_region(td, pixels, width, height, stride, qh, nthreads, nt > 0 ? tasks[2 * nt - 1] : 1);
-        } else {
-            in->gpu_pending = gpu_choose(in) && gpu_submit(td, pixels, width, height, stride, qh, 0, qh - 1);
-        }
+    if (in->metal && pooled) {
+        /* the threads write the thresholded image for the GPU */
+        uint8_t *gt = gpu_threshold_buffer(td, qw, qh);
+        if (gt) in->buf_t = gt;
+    } else if (in->metal && qh >= 8) {
+        in->gpu_pending = gpu_choose(in) && gpu_submit(td, pixels, width, height, stride, qh, 0, qh - 1);
     }
 #endif
     uint8_t *qim = in->buf_qim;

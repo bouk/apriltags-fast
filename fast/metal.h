@@ -67,8 +67,16 @@ at_metal *at_metal_create(void);
 void at_metal_destroy(at_metal *m);
 /* Start the stage for an image; it first waits for the work before it.
    Returns false if it cannot run (the caller then uses the CPU stage).
-   The image must stay as it is until at_metal_finish. */
+   The image must stay as it is until at_metal_finish. With pixels NULL
+   the GPU works from the buffer of at_metal_threshold_buffer: width and
+   height are then those of the quad detection image, and decimate 1. */
 bool at_metal_submit(at_metal *m, const uint8_t *pixels, const at_metal_params *p);
+/* The buffer of the thresholded image of a w x h quad detection image
+   (rows w bytes apart), or NULL if it cannot be used now. The caller
+   writes the image there; at_metal_submit with pixels NULL then works
+   from it (no decimation and no threshold on the GPU), and reads it
+   until the work ends. */
+uint8_t *at_metal_threshold_buffer(at_metal *m, int64_t w, int64_t h);
 /* Whether the work ended (any thread can ask). */
 bool at_metal_done(at_metal *m);
 /* The result of work that ended. Returns false if it failed or a buffer

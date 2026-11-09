@@ -597,6 +597,19 @@ void at_metal_finish(at_metal *mm) {
     }
 }
 
+uint8_t *at_metal_threshold_buffer(at_metal *mm, int64_t w, int64_t h) {
+    @autoreleasepool {
+        ATMetal *m = (__bridge ATMetal *)mm->obj;
+        /* work that still reads the buffer: not now */
+        if (atomic_load(&mm->state) == 1) return NULL;
+        at_metal_finish(mm);
+        atomic_store(&mm->state, 0);
+        if (w < 8 || h < 8 || w > 32767 || h > 32767 || w * h > (INT64_C(1) << 26)) return NULL;
+        if (!fit_buffers(m, w, h)) return NULL;
+        return (uint8_t *)m->t.contents;
+    }
+}
+
 bool at_metal_submit(at_metal *mm, const uint8_t *pixels, const at_metal_params *ap) {
     @autoreleasepool {
         ATMetal *m = (__bridge ATMetal *)mm->obj;
@@ -611,33 +624,36 @@ bool at_metal_submit(at_metal *mm, const uint8_t *pixels, const at_metal_params 
         int64_t ya = ap->y0, yb = ap->y1;
         if (ya < 0 || yb >= h || yb - ya < 2) return false;
         if (!fit_buffers(m, w, h)) return false;
-        /* the caller's image: its pages as a buffer without a copy (they
-           stay mapped until at_metal_finish), or a copy if Metal refuses */
-        int64_t sbytes = ap->stride * (ap->height - 1) + ap->width;
-        uintptr_t page = (uintptr_t)getpagesize();
-        uintptr_t p0 = (uintptr_t)pixels & ~(page - 1);
-        uintptr_t p1 = ((uintptr_t)pixels + (uintptr_t)sbytes + page - 1) & ~(page - 1);
         id<MTLBuffer> src = nil;
-        static int nocopy = -1;
-        if (nocopy < 0) {
-            const char *e = getenv("APRILTAG_GPU_COPY");
-            nocopy = !(e && e[0] == '1');
-        }
-        if (nocopy)
-            src = [m->dev newBufferWithBytesNoCopy:(void *)p0
-                                            length:p1 - p0
-                                           options:MTLResourceStorageModeShared
-                                       deallocator:nil];
-        uint32_t soff = (uint32_t)((uintptr_t)pixels - p0);
-        if (!src) {
-            if (m->src_cap < sbytes) {
-                m->src = new_buffer(m, sbytes);
-                m->src_cap = m->src ? sbytes : 0;
-                if (!m->src) return false;
+        uint32_t soff = 0;
+        if (pixels) {
+            /* the caller's image: its pages as a buffer without a copy (they
+               stay mapped until at_metal_finish), or a copy if Metal refuses */
+            int64_t sbytes = ap->stride * (ap->height - 1) + ap->width;
+            uintptr_t page = (uintptr_t)getpagesize();
+            uintptr_t p0 = (uintptr_t)pixels & ~(page - 1);
+            uintptr_t p1 = ((uintptr_t)pixels + (uintptr_t)sbytes + page - 1) & ~(page - 1);
+            static int nocopy = -1;
+            if (nocopy < 0) {
+                const char *e = getenv("APRILTAG_GPU_COPY");
+                nocopy = !(e && e[0] == '1');
             }
-            memcpy(m->src.contents, pixels, (size_t)sbytes);
-            src = m->src;
-            soff = 0;
+            if (nocopy)
+                src = [m->dev newBufferWithBytesNoCopy:(void *)p0
+                                                length:p1 - p0
+                                               options:MTLResourceStorageModeShared
+                                           deallocator:nil];
+            soff = (uint32_t)((uintptr_t)pixels - p0);
+            if (!src) {
+                if (m->src_cap < sbytes) {
+                    m->src = new_buffer(m, sbytes);
+                    m->src_cap = m->src ? sbytes : 0;
+                    if (!m->src) return false;
+                }
+                memcpy(m->src.contents, pixels, (size_t)sbytes);
+                src = m->src;
+                soff = 0;
+            }
         }
         m->src_now = src;
 
@@ -716,18 +732,20 @@ bool at_metal_submit(at_metal *mm, const uint8_t *pixels, const at_metal_params 
     } while (0)
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setBytes:&kp length:sizeof kp atIndex:0];
-        set_buffers(enc, @[src, m->qim]);
-        run2d(enc, m->pso[ap->decimate == 2 ? K_DEC2 : K_COPY], w, (cy1 < h ? cy1 : h - 1) - cy0 + 1);
-        STEP();
-        set_buffers(enc, @[m->qim, m->tmm]);
-        run2d(enc, m->pso[K_TILE], tw, ty1 - ty0 + 1);
-        STEP();
-        set_buffers(enc, @[m->tmm, m->tth]);
-        run2d(enc, m->pso[K_TTHR], tw, hy1 - hy0 + 1);
-        STEP();
-        set_buffers(enc, @[m->qim, m->tth, m->t]);
-        run2d(enc, m->pso[K_THRESH], w, nr);
-        STEP();
+        if (pixels) {
+            set_buffers(enc, @[src, m->qim]);
+            run2d(enc, m->pso[ap->decimate == 2 ? K_DEC2 : K_COPY], w, (cy1 < h ? cy1 : h - 1) - cy0 + 1);
+            STEP();
+            set_buffers(enc, @[m->qim, m->tmm]);
+            run2d(enc, m->pso[K_TILE], tw, ty1 - ty0 + 1);
+            STEP();
+            set_buffers(enc, @[m->tmm, m->tth]);
+            run2d(enc, m->pso[K_TTHR], tw, hy1 - hy0 + 1);
+            STEP();
+            set_buffers(enc, @[m->qim, m->tth, m->t]);
+            run2d(enc, m->pso[K_THRESH], w, nr);
+            STEP();
+        }
         set_buffers(enc, @[m->t, m->parent, m->size, m->soff]);
         run2d(enc, m->pso[K_ROWS], m->nseg, nr);
         STEP();

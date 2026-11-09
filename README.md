@@ -191,34 +191,45 @@ CPU. The order of the clusters comes from the roots of the union-find of
 the CPU, so the CPU still does its threshold and union-find, at the same
 time as the GPU.
 
-- One thread: the GPU does the whole cluster stage. `AT_GPU_AUTO`
-  measures both paths and uses the faster one.
-- More threads (`AT_GPU_ON` only): the GPU is one more worker. It makes
-  the points of the last bands of the image, and a band task takes them
-  if the GPU is done when the task starts.
+- One thread: the GPU does the whole cluster stage from the caller's
+  image. `AT_GPU_AUTO` measures both paths and uses the faster one.
+- More threads (`AT_GPU_ON` only): the GPU is one more worker. The
+  threads write the thresholded image into a buffer of the GPU. After the
+  threshold stage the GPU labels the last bands of the image on its own
+  and makes their points. A band task that starts when the GPU is done
+  takes those points (the CPU removes the points of components that are
+  too small, which the GPU cannot know); if the GPU is not done, the task
+  makes the points itself. The part of the image that the GPU gets
+  follows how often it was in time.
 
 Measured, ms for each photo (3196 x 2132, tag36h11, min of several runs):
 
 | device | decimate | threads | CPU | with GPU |
 | --- | --- | --- | --- | --- |
 | iPhone 18 Pro | 2 | 1 | 9.95 | 9.24 |
-| iPhone 18 Pro | 2 | 8 | 3.19 | 3.21 |
+| iPhone 18 Pro | 2 | 8 | 3.14 | 3.13 |
 | iPhone 18 Pro | 1 | 1 | 27.67 | 24.33 |
-| iPhone 18 Pro | 1 | 8 | 8.57 | 8.76 |
+| iPhone 18 Pro | 1 | 8 | 8.48 | 8.51 |
 | M3 Pro | 2 | 1 | 14.5 | 13.2 |
-| M3 Pro | 2 | 8 | 3.2 | 3.3 |
+| M3 Pro | 2 | 8 | 2.6 | 2.6 |
 
 The GPU makes an image faster with one thread only. With all cores in
-use it does not, for these measured reasons:
+use the times are equal (the differences are less than the noise of 1%),
+for these measured reasons:
 
-- The GPU can only take the cluster stage (25 to 30% of an image).
-- The GPU gets about 3 times slower while all CPU cores work (the chip
-  shares its power and memory between them): alone it does the stage of a
-  6.8 MP image in 4.9 ms, the 8 threads do it in 2.5 ms.
-- A band whose points come from the GPU still costs the CPU 75% of a
-  band that it makes itself (181 against 240 us): most of the stage is
-  the cluster tables, not the pixel work.
-- A command buffer starts 0.1 to 1.3 ms after the commit.
+- The GPU can only take the cluster stage (25 to 30% of an image): Apple
+  GPUs have no 64-bit floats.
+- The chip shares its power and memory between the CPU and the GPU. The
+  GPU gets about 3 times slower while all CPU cores work: alone it does
+  the stage of a 6.8 MP image in 4.3 ms, with the threads at work it does
+  a quarter of the image in 3.7 ms. And what the GPU takes from the
+  cluster stage (2.45 to 2.35 ms on the phone), the fit stage loses (4.1
+  to 4.2 ms). The phone is also not faster with 8 threads than with 6.
+- A band whose points come from the GPU still costs the CPU half of a
+  band that it makes itself: most of the stage is the cluster tables and
+  the copy of the points, not the pixel work.
+- A command buffer starts 0.1 to 1.3 ms after the commit (0.35 ms on the
+  phone).
 
 Debug variables: `APRILTAG_GPU_PROF=1` (the GPU time of each kernel),
 `APRILTAG_GPU_TRACE=1` (the timing of the region and of the band tasks),

@@ -397,6 +397,7 @@ struct at_internal {
     struct at_metal *metal;
     at_gpu_mode gpu_mode;
     bool gpu_pending;
+    bool gpu_t; /* the thresholded image of this image is in the GPU's buffer */
     bool gpu_used; /* the GPU stage gave the clusters of this image */
     /* AT_GPU_AUTO: the images so far, the average seconds for each
        boundary point without and with the GPU, and the boundary points

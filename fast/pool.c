@@ -634,6 +634,7 @@ static void cluster_task(struct at_pool *p, at_ctx *cx, const ClusterJob *job, i
     while (m < nr) m *= 2;
     ct_init(cx, &ct, m);
     bool from_gpu = false;
+    int64_t gtotal = 0;
 #if defined(AT_METAL)
     at_metal_out g;
     /* APRILTAG_GPU_FORCE (tests): wait for the GPU */
@@ -641,7 +642,7 @@ static void cluster_task(struct at_pool *p, at_ctx *cx, const ClusterJob *job, i
         while (!at_metal_done(job->metal)) sched_yield();
     if (job->metal && k >= job->gk0 && at_metal_done(job->metal) && at_metal_get(job->metal, &g)) {
         RunRows rr = {job->runs, ro, w};
-        gpu_band_points(cx, &ct, &g, rr, job->uf, job->vcol_base, job->min_cluster_pixels, y0, n);
+        gtotal = gpu_band_scan(cx, &ct, &g, rr, job->uf, job->vcol_base, job->min_cluster_pixels, y0, n);
         __atomic_fetch_add(job->gused, 1, __ATOMIC_RELAXED);
         from_gpu = true;
     }
@@ -674,7 +675,8 @@ static void cluster_task(struct at_pool *p, at_ctx *cx, const ClusterJob *job, i
     int64_t base = 4 * w * (y0 - 1);
     int64_t nslots = ct.ids.len, nc = 0;
     for (int64_t s = 0; s < nslots; s++) nc += ct.counts.data[s] != 0;
-    int64_t gap = ct.pts.len + PT_PAD * nc <= 4 * w * n ? PT_PAD : 0;
+    int64_t npts = from_gpu ? gtotal : ct.pts.len;
+    int64_t gap = npts + PT_PAD * nc <= 4 * w * n ? PT_PAD : 0;
     uint32_t *pos = STK_ALLOC(cx, uint32_t, nslots);
     uint64_t *ids = p->clids + base;
     uint32_t *counts = p->clcounts + base;
@@ -689,7 +691,12 @@ static void cluster_task(struct at_pool *p, at_ctx *cx, const ClusterJob *job, i
         pos[s] = at;
         at += c + (uint32_t)gap;
     }
-    scatter_points(&ct, pos, p->clpts + base, gap == PT_PAD);
+#if defined(AT_METAL)
+    if (from_gpu)
+        gpu_band_copy(&ct, &g, pos, p->clpts + base, gap == PT_PAD);
+    else
+#endif
+        scatter_points(&ct, pos, p->clpts + base, gap == PT_PAD);
     job->ncl[k] = nc;
     job->gap[k] = gap;
     if (job->tns) {
@@ -1039,6 +1046,16 @@ static void quad_thresh_pooled(at_detector *td, uint8_t *im, int64_t w, int64_t 
     double t1 = at_clock();
     td->timing.threshold = t1 - t0;
 
+#if defined(AT_METAL)
+    if (in->gpu_t) {
+        /* the GPU works on the last bands from here on */
+        at_mark gm = stk_enter(cx);
+        int64_t *tasks = STK_ALLOC(cx, int64_t, 2 * unionfind_max_tasks(h));
+        int64_t nt = unionfind_tasks(h, nthreads, tasks);
+        gpu_submit_region(td, w, h, nthreads, nt > 0 ? tasks[2 * nt - 1] : 1);
+        stk_leave(cx, gm);
+    }
+#endif
     UfNode *uf = in->buf_uf;
     uint8_t *edge = STK_ALLOC(cx, uint8_t, 2 * h);
     row_edges(t, w, h, edge);
