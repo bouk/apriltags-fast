@@ -92,3 +92,28 @@ a shared machine is 5% or more. Compare min and median per stage.
   gives gcc's reason. Valgrind has no AVX-512: it runs the AVX2 versions.
   `-DAT_SIMD_DEBUG` with `AT_SIMD_V1=",name,"` runs named SIMD functions
   at AVX2; `AT_SIMD=0` or `1` lowers all of them.
+
+## GPU stage (Metal)
+
+- Read the "GPU (Metal)" part of README.md first: it has the design and
+  the measured limits. Do not expect a gain with more than one thread.
+- `fast/metal.m` is Objective-C with ARC (CMake: only with clang on
+  Apple; SwiftPM: `AT_METAL` in Package.swift of the Swift package). The
+  kernels are a string in that file (`MSL(...)`): no `#` lines, no
+  single quotes, and no comma outside parentheses in them.
+- The kernels must give the pixel connections, the component sizes and
+  the point rules of `unionfind.c` and `clusters.c` exactly (column 0,
+  the last column, 8-connected white, the rows after `row_end`, the
+  (-1,1) point rule). Change them together.
+- A GPU thread with a long loop is slow: the row kernels work on
+  segments of `AT_METAL_SEG` pixels. An entry holds the count of a
+  segment in 8 bits, so `AT_METAL_SEG` cannot be more than 64.
+- Verify a change to the GPU stage: CPU and GPU hex detections must be
+  equal (`apriltag_fast_demo --hex-detections`, with and without
+  `--gpu`) for 1 thread and for more threads with
+  `APRILTAG_GPU_FORCE=0.07`, `0.23`, `0.5` and `0.95`, decimate 1 and 2.
+  Without the force variable the GPU is seldom in time on a Mac, and the
+  test then tests nothing. Also run `ctest` with `APRILTAG_GPU=1`.
+- GPU times change with the power state of the GPU by a factor of 2:
+  compare alternate runs, and measure on the phone (the example app of
+  the Swift package has a benchmark mode, `AT_BENCH=1`).

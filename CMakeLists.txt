@@ -41,6 +41,15 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
 endif()
 set_source_files_properties(fast/apriltag_all.c PROPERTIES COMPILE_OPTIONS "${FAST_FLAGS}")
 
+# The GPU cluster stage (Metal), on Apple platforms.
+if(APPLE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    enable_language(OBJC)
+    target_sources(${PROJECT_NAME} PRIVATE fast/metal.m)
+    set_source_files_properties(fast/metal.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AT_METAL)
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Metal" "-framework Foundation" "-framework QuartzCore")
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT APPLE)
     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-z,relro,-z,now,-z,defs")
 endif()

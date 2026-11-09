@@ -66,6 +66,12 @@ typedef struct at_detection {
 /* Time spent in each stage of the last detection, in seconds. */
 typedef struct at_timing {
     double decimate, blur, threshold, unionfind, clusters, fit_quads, decode, reconcile, total;
+    /* The time the GPU worked for the image (0: the GPU stage did not
+       run, or its result was not used). */
+    double gpu;
+    /* With threads: the part of the cluster stage that came from the
+       GPU (0 to 1). */
+    double gpu_share;
 } at_timing;
 
 struct at_internal;
@@ -112,6 +118,20 @@ const char *at_family_name(const at_detector *td, const at_detection *d);
 /* Detect tags in a gray image: width x height pixels, rows `stride`
    bytes apart. The input is never changed. */
 void at_detect(at_detector *td, const uint8_t *pixels, int64_t width, int64_t height, int64_t stride);
+
+/* The GPU (Metal, Apple platforms) can do work of the cluster stage, at
+   the same time as the CPU. The detections are the same with and without
+   it. With one thread the GPU does the whole stage while the CPU does the
+   threshold and the union-find; AT_GPU_AUTO then measures both paths and
+   uses the faster one. With more threads the GPU is one more worker: it
+   does the last part of the image, as much as it can do in time, and the
+   threads do the rest (AT_GPU_ON and AT_GPU_AUTO are then the same).
+   Images and settings that the GPU stage does not support (a decimation
+   other than 1 or 2, blur, deglitch, debug) use the CPU. Returns whether
+   a GPU is in use. The environment variable APRILTAG_GPU (1: on, auto)
+   sets the mode of new detectors. */
+typedef enum { AT_GPU_OFF, AT_GPU_ON, AT_GPU_AUTO } at_gpu_mode;
+bool at_use_gpu(at_detector *td, at_gpu_mode mode);
 
 /* Stop the worker threads. They start again on the next at_detect. */
 void at_shutdown(at_detector *td);

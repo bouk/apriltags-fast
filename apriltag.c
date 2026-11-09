@@ -149,6 +149,20 @@ static void fill_timeprofile(timeprofile_t *tp, const at_timing *t)
     }
 }
 
+bool apriltag_detector_use_gpu(apriltag_detector_t *td, int mode)
+{
+    return at_use_gpu(td->fast, mode == 1 ? AT_GPU_ON : mode == 2 ? AT_GPU_AUTO : AT_GPU_OFF);
+}
+
+void apriltag_detector_stage_ms(const apriltag_detector_t *td, double ms[11])
+{
+    const at_timing *t = &td->fast->timing;
+    const double v[10] = {t->decimate, t->blur, t->threshold, t->unionfind, t->clusters,
+                          t->fit_quads, t->decode, t->reconcile, t->total, t->gpu};
+    for (int i = 0; i < 10; i++) ms[i] = v[i] * 1000.0;
+    ms[10] = t->gpu_share;
+}
+
 zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
 {
     zarray_t *detections = zarray_create(sizeof(apriltag_detection_t *));

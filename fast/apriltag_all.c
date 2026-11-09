@@ -15,6 +15,7 @@
 #include "unionfind.c"
 #include "clusters.c"
 #include "quads.c"
+#include "gpu.c"
 #include "decode.c"
 #include "pool.c"
 #include "detector.c"

@@ -280,6 +280,18 @@ void apriltag_detector_destroy(apriltag_detector_t *td);
 // _detection_destroy and zarray_destroy yourself.
 zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig);
 
+// apriltags-fast: the GPU (Metal, Apple platforms) can do the cluster
+// stage. mode: 0 off (the default), 1 on, 2 the faster of the CPU and the
+// GPU (measured while it runs). The detections are the same in all modes.
+// Returns whether a GPU is in use. See at_use_gpu in fast/apriltag_fast.h.
+bool apriltag_detector_use_gpu(apriltag_detector_t *td, int mode);
+
+// apriltags-fast: the time of each stage of the last detection, in
+// milliseconds: decimate, blur, threshold, unionfind, clusters, fit_quads,
+// decode, reconcile, total, gpu (the time the GPU worked). The last value
+// is the part of the cluster stage that came from the GPU (0 to 1).
+void apriltag_detector_stage_ms(const apriltag_detector_t *td, double ms[11]);
+
 // Call this method on each of the tags returned by apriltag_detector_detect
 void apriltag_detection_destroy(apriltag_detection_t *det);
 

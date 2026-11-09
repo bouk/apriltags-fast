@@ -24,6 +24,8 @@ static void usage(void) {
          "      --save-detections <file>  Save detections to this file as TSV\n"
          "      --hex-detections <file>   Save detections with exact hex floats\n"
          "      --timing                  Print the time of each stage\n"
+         "      --gpu                     Use the GPU for the cluster stage (Apple)\n"
+         "      --gpu-auto                Use the GPU when it is faster\n"
          "      --deglitch, --min-cluster-pixels <n>, --max-nmaxima <n>, --min-white-black-diff <n>,\n"
          "      --max-line-fit-mse <f>, --sharpening <f>, --critical-angle <deg>: detector parameters");
 }
@@ -88,6 +90,7 @@ int main(int argc, char **argv) {
     int64_t iters = 1, threads = 1, hamming = 1;
     double decimate = 2.0, blur = 0.0;
     bool refine = true, quiet = false, debug = false, deglitch = false, timing = false;
+    at_gpu_mode gpu = AT_GPU_OFF;
     const char *tsv_path = NULL, *hex_path = NULL;
     int64_t mcp = 24, maxnm = 10, mwbd = 5;
     double mse = 10.0, sharpening = 0.25, crit_deg = 10.0;
@@ -112,6 +115,8 @@ int main(int argc, char **argv) {
         else if (IS("--save-detections")) tsv_path = NEXT();
         else if (IS("--deglitch")) deglitch = true;
         else if (IS("--timing")) timing = true;
+        else if (IS("--gpu")) gpu = AT_GPU_ON;
+        else if (IS("--gpu-auto")) gpu = AT_GPU_AUTO;
         else if (IS("--min-cluster-pixels")) mcp = parse_i64(NEXT());
         else if (IS("--max-nmaxima")) maxnm = parse_i64(NEXT());
         else if (IS("--min-white-black-diff")) mwbd = parse_i64(NEXT());
@@ -134,6 +139,7 @@ int main(int argc, char **argv) {
         puts("\"hamming\" parameter is out-of-range.");
         exit(-1);
     }
+    if (gpu != AT_GPU_OFF && !at_use_gpu(td, gpu)) puts("no GPU: using the CPU");
     td->quad_decimate = (float)decimate;
     td->quad_sigma = (float)blur;
     td->nthreads = (int32_t)threads;
@@ -169,6 +175,8 @@ int main(int argc, char **argv) {
             st.blur += td->timing.blur;
             st.threshold += td->timing.threshold;
             st.unionfind += td->timing.unionfind;
+            st.gpu += td->timing.gpu;
+            st.gpu_share += td->timing.gpu_share;
             st.clusters += td->timing.clusters;
             st.fit_quads += td->timing.fit_quads;
             st.decode += td->timing.decode;
@@ -202,6 +210,7 @@ int main(int argc, char **argv) {
         double v[8] = {st.decimate, st.blur, st.threshold, st.unionfind, st.clusters, st.fit_quads, st.decode,
                        st.reconcile};
         for (int k = 0; k < 8; k++) printf("  %s %.3f ms\n", names[k], v[k] * 1000.0 / n);
+        if (st.gpu > 0.0) printf("  gpu %.3f ms\n  gpu_share %.2f\n", st.gpu * 1000.0 / n, st.gpu_share / n);
     }
     at_detector_destroy(td);
     free(tsv.data);

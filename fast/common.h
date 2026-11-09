@@ -393,6 +393,25 @@ struct at_internal {
     /* the scratch stacks of the calling thread */
     at_ctx mcx;
     struct at_pool *pool;
+    /* the GPU stage (NULL: not in use), and whether it runs for this image */
+    struct at_metal *metal;
+    at_gpu_mode gpu_mode;
+    bool gpu_pending;
+    bool gpu_used; /* the GPU stage gave the clusters of this image */
+    /* AT_GPU_AUTO: the images so far, the average seconds for each
+       boundary point without and with the GPU, and the boundary points
+       of this image */
+    int64_t gpu_frames;
+    int64_t gpu_points;
+    /* the path in use, and when it tries the other one */
+    bool gpu_best;
+    int64_t gpu_probe, gpu_next_probe;
+    /* with the pool: the first cluster task of the GPU, the part of the
+       tasks that it gets, and the images to go without it */
+    int64_t gpu_k0;
+    double gpu_frac;
+    int64_t gpu_skip, gpu_backoff;
+    double gpu_ema[2];
 };
 
 #endif

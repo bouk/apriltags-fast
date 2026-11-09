@@ -580,6 +580,14 @@ typedef struct {
     /* per task: the number of clusters and the gap after each */
     int64_t *ncl;
     int64_t *gap;
+    /* the GPU stage works on the tasks from gk0 on (NULL: no GPU). A
+       task takes its points from the GPU if the GPU is done when the
+       task starts, else the task makes them itself. gused counts the
+       tasks that took them (atomic). */
+    struct at_metal *metal;
+    int64_t gk0;
+    int64_t *gused;
+    int64_t *tns; /* trace: ns of CPU tasks, of GPU tasks, CPU tasks */
 } ClusterJob;
 
 /* The representative of a node of the finished union-find, and whether
@@ -620,30 +628,46 @@ static void cluster_task(struct at_pool *p, at_ctx *cx, const ClusterJob *job, i
     const uint32_t *ro = job->row_off;
     int64_t r0 = ro[y0];
     int64_t nr = ro[y0 + n + 1] - r0;
-    uint32_t *rep = STK_ALLOC(cx, uint32_t, nr);
-    uint8_t *ok = STK_ALLOC(cx, uint8_t, nr);
-    /* every node points at its task's root: runs with the same parent
-       have the same representative */
-    uint32_t lp = UINT32_MAX, lr = 0;
-    uint8_t lo = 0;
-    for (int64_t i = 0; i < nr; i++) {
-        uint32_t par = job->uf[r0 + i].parent;
-        if (par != lp) {
-            lr = shared_rep(job->uf, par, job->min_cluster_pixels, &lo);
-            lp = par;
-        }
-        rep[i] = lr;
-        ok[i] = lo;
-    }
-    uint32_t *vrep = STK_ALLOC(cx, uint32_t, n + 1);
-    uint8_t *vok = STK_ALLOC(cx, uint8_t, n + 1);
-    for (int64_t j = 0; j <= n; j++) vrep[j] = shared_rep(job->uf, job->vcol_base + y0 + j, job->min_cluster_pixels, &vok[j]);
+    double tt0 = job->tns ? at_clock() : 0.0;
     ClusterTable ct;
     int64_t m = 64;
     while (m < nr) m *= 2;
     ct_init(cx, &ct, m);
-    PoolRows pr = {job->runs, ro, w, y0, r0, rep, ok};
-    gradient_points(cx, &ct, job->t + y0 * w, w, y0, n, pool_row, &pr, vrep, vok);
+    bool from_gpu = false;
+#if defined(AT_METAL)
+    at_metal_out g;
+    /* APRILTAG_GPU_FORCE (tests): wait for the GPU */
+    if (job->metal && k >= job->gk0 && gpu_force() > 0.0)
+        while (!at_metal_done(job->metal)) sched_yield();
+    if (job->metal && k >= job->gk0 && at_metal_done(job->metal) && at_metal_get(job->metal, &g)) {
+        RunRows rr = {job->runs, ro, w};
+        gpu_band_points(cx, &ct, &g, rr, job->uf, job->vcol_base, job->min_cluster_pixels, y0, n);
+        __atomic_fetch_add(job->gused, 1, __ATOMIC_RELAXED);
+        from_gpu = true;
+    }
+#endif
+    if (!from_gpu) {
+        uint32_t *rep = STK_ALLOC(cx, uint32_t, nr);
+        uint8_t *ok = STK_ALLOC(cx, uint8_t, nr);
+        /* every node points at its task's root: runs with the same parent
+           have the same representative */
+        uint32_t lp = UINT32_MAX, lr = 0;
+        uint8_t lo = 0;
+        for (int64_t i = 0; i < nr; i++) {
+            uint32_t par = job->uf[r0 + i].parent;
+            if (par != lp) {
+                lr = shared_rep(job->uf, par, job->min_cluster_pixels, &lo);
+                lp = par;
+            }
+            rep[i] = lr;
+            ok[i] = lo;
+        }
+        uint32_t *vrep = STK_ALLOC(cx, uint32_t, n + 1);
+        uint8_t *vok = STK_ALLOC(cx, uint8_t, n + 1);
+        for (int64_t j = 0; j <= n; j++) vrep[j] = shared_rep(job->uf, job->vcol_base + y0 + j, job->min_cluster_pixels, &vok[j]);
+        PoolRows pr = {job->runs, ro, w, y0, r0, rep, ok};
+        gradient_points(cx, &ct, job->t + y0 * w, w, y0, n, pool_row, &pr, vrep, vok);
+    }
     /* the clusters in slot order, without the empty ones; their points
        grouped by cluster, padded when the points and the gaps fit in the
        band's 4w points a row */
@@ -668,6 +692,10 @@ static void cluster_task(struct at_pool *p, at_ctx *cx, const ClusterJob *job, i
     scatter_points(&ct, pos, p->clpts + base, gap == PT_PAD);
     job->ncl[k] = nc;
     job->gap[k] = gap;
+    if (job->tns) {
+        __atomic_fetch_add(&job->tns[from_gpu ? 1 : 0], (int64_t)((at_clock() - tt0) * 1e9), __ATOMIC_RELAXED);
+        if (!from_gpu) __atomic_fetch_add(&job->tns[2], 1, __ATOMIC_RELAXED);
+    }
     stk_leave(cx, mk);
     flag_set(p, k, job->epoch);
 }
@@ -824,11 +852,11 @@ static void run_stage(struct at_pool *p, at_ctx *cx) {
    merged here in band order, which gives the same points in the same
    order as one sweep. The fit tasks then read the points of their
    clusters in the bands. Returns the time at the end of the clusters. */
-static double clusters_fit_parallel(at_ctx *cx, struct at_pool *p, const at_detector *td, const uint8_t *t, int64_t w,
+static double clusters_fit_parallel(at_ctx *cx, struct at_pool *p, at_detector *td, const uint8_t *t, int64_t w,
                                     int64_t h, const uint32_t *row_off, const UfNode *uf, const uint8_t *im,
                                     int64_t tag_width, bool normal_border, bool reversed_border, int64_t nthreads,
                                     const DecodeParams *dp, vec_quad *quads, DecodeOut *res) {
-    const struct at_internal *in = td->in;
+    struct at_internal *in = td->in;
     int64_t vcol_base = row_off[h];
     int64_t nrows = h - 2;
     int64_t chunk = 1 + nrows / (TASKS_PER_THREAD * nthreads);
@@ -836,8 +864,19 @@ static double clusters_fit_parallel(at_ctx *cx, struct at_pool *p, const at_dete
     int64_t *ncl = STK_ALLOC(cx, int64_t, ntasks);
     int64_t *gaps = STK_ALLOC(cx, int64_t, ntasks);
     int64_t ep = ++p->epoch;
+    int64_t gused = 0;
     ClusterJob cj = {w,       h,       chunk, ntasks, vcol_base, td->qtp.min_cluster_pixels, ep, t, p->runs, row_off,
-                     uf,      ncl,     gaps};
+                     uf,      ncl,     gaps,  NULL,   ntasks,    &gused, NULL};
+    int64_t tns[3] = {0, 0, 0};
+    static int trace = -1;
+    if (trace < 0) trace = getenv("APRILTAG_GPU_TRACE") != NULL;
+    if (trace) cj.tns = tns;
+#if defined(AT_METAL)
+    if (in->gpu_pending) {
+        cj.metal = in->metal;
+        cj.gk0 = in->gpu_k0;
+    }
+#endif
     counter_set(p, C_CLUSTERS, 0);
     int32_t njobs = (int32_t)imin(nthreads - 1, ntasks);
     post_jobs(p, STAGE_CLUSTERS, &cj, njobs);
@@ -884,6 +923,11 @@ static double clusters_fit_parallel(at_ctx *cx, struct at_pool *p, const at_dete
     }
     cfirst[ntasks] = gslot.len;
     finish_jobs(p, njobs);
+#if defined(AT_METAL)
+    if (in->gpu_pending) gpu_region_result(td, ntasks - cj.gk0, gused);
+    if (trace && (in->gpu_frames & 63) == 62)
+        fprintf(stderr, "bands: %lld cpu %.1f us each, %lld gpu %.1f us each\n", (long long)tns[2], tns[2] ? (double)tns[0] / 1e3 / (double)tns[2] : 0.0, (long long)gused, gused ? (double)tns[1] / 1e3 / (double)gused : 0.0);
+#endif
     int64_t nseg = gslot.len;
     uint32_t *rank = STK_ALLOC(cx, uint32_t, ct.ids.len);
     vec_u32 cstart;

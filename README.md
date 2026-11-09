@@ -174,3 +174,54 @@ cmake -B build -DBUILD_TESTING=ON && cmake --build build -j
 ## License
 
 BSD 2-Clause, as the AprilTag library (`LICENSE.md`).
+
+## GPU (Metal)
+
+On Apple platforms the GPU can do work of the cluster stage
+(`fast/metal.m`, `fast/gpu.c`). It is off by default. Turn it on with
+`at_use_gpu` (`apriltag_detector_use_gpu` in the upstream API, `--gpu` or
+`--gpu-auto` in `apriltag_fast_demo`, or `APRILTAG_GPU=1` / `auto` in the
+environment). The detections are bit-identical with and without it.
+
+The GPU decimates and thresholds the image, labels the connected
+components (a lock-free union-find with atomics), and emits the boundary
+points with their clusters in a hash table. Apple GPUs have no 64-bit
+floats, so the quad fit, the edge refinement and the decode stay on the
+CPU. The order of the clusters comes from the roots of the union-find of
+the CPU, so the CPU still does its threshold and union-find, at the same
+time as the GPU.
+
+- One thread: the GPU does the whole cluster stage. `AT_GPU_AUTO`
+  measures both paths and uses the faster one.
+- More threads (`AT_GPU_ON` only): the GPU is one more worker. It makes
+  the points of the last bands of the image, and a band task takes them
+  if the GPU is done when the task starts.
+
+Measured, ms for each photo (3196 x 2132, tag36h11, min of several runs):
+
+| device | decimate | threads | CPU | with GPU |
+| --- | --- | --- | --- | --- |
+| iPhone 18 Pro | 2 | 1 | 9.95 | 9.24 |
+| iPhone 18 Pro | 2 | 8 | 3.19 | 3.21 |
+| iPhone 18 Pro | 1 | 1 | 27.67 | 24.33 |
+| iPhone 18 Pro | 1 | 8 | 8.57 | 8.76 |
+| M3 Pro | 2 | 1 | 14.5 | 13.2 |
+| M3 Pro | 2 | 8 | 3.2 | 3.3 |
+
+The GPU makes an image faster with one thread only. With all cores in
+use it does not, for these measured reasons:
+
+- The GPU can only take the cluster stage (25 to 30% of an image).
+- The GPU gets about 3 times slower while all CPU cores work (the chip
+  shares its power and memory between them): alone it does the stage of a
+  6.8 MP image in 4.9 ms, the 8 threads do it in 2.5 ms.
+- A band whose points come from the GPU still costs the CPU 75% of a
+  band that it makes itself (181 against 240 us): most of the stage is
+  the cluster tables, not the pixel work.
+- A command buffer starts 0.1 to 1.3 ms after the commit.
+
+Debug variables: `APRILTAG_GPU_PROF=1` (the GPU time of each kernel),
+`APRILTAG_GPU_TRACE=1` (the timing of the region and of the band tasks),
+`APRILTAG_GPU_FORCE=<part>` (tests: with threads, the GPU gets this part
+of the image and the tasks wait for it), `APRILTAG_GPU_COPY=1` (copy the
+image to the GPU; the default uses its pages in place).

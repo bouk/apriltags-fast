@@ -27,6 +27,9 @@ at_detector *at_detector_create(void) {
     svec_take(&in->dcx, in->dets);
     at_ctx_init(&in->mcx, AT_MATCH_NSTACKS, 0);
     qsm_kernel_init();
+    const char *env = getenv("APRILTAG_GPU");
+    if (env && env[0] == '1') at_use_gpu(td, AT_GPU_ON);
+    if (env && strcmp(env, "auto") == 0) at_use_gpu(td, AT_GPU_AUTO);
     return td;
 }
 
@@ -35,6 +38,7 @@ void at_shutdown(at_detector *td) { pool_stop(td->in); }
 void at_detector_destroy(at_detector *td) {
     if (!td) return;
     pool_stop(td->in);
+    at_use_gpu(td, AT_GPU_OFF);
     at_ctx_release(&td->in->dcx);
     at_ctx_release(&td->in->mcx);
     at_ctx_release(&td->in->icx);
@@ -219,27 +223,49 @@ static void quad_thresh_single(at_detector *td, const uint8_t *im, int64_t w, in
     double t2 = at_clock();
     td->timing.unionfind = t2 - t1;
 
-    ClusterTable ct;
-    ct_init(cx, &ct, cluster_map_size(w, h, 1));
     bool normal_border, reversed_border;
     int64_t tag_width = min_tag_width(td, &normal_border, &reversed_border);
-    uint32_t *rep = STK_ALLOC(cx, uint32_t, nnodes);
-    uint8_t *ok = STK_ALLOC(cx, uint8_t, nnodes);
-    resolve_range(uf, 0, nnodes, td->qtp.min_cluster_pixels, rep, ok);
-    if (h >= 3) {
-        /* rows 1..h-2, each against the row below */
-        PackedRows pr = {runs.data, row_off + 1, rep, ok};
-        gradient_points(cx, &ct, t + w, w, 1, h - 2, packed_row, &pr, rep + nruns + 1, ok + nruns + 1);
-    }
     vec_pt cpts;
     vec_u32 cstart;
     svec_take(cx, cpts);
     svec_take(cx, cstart);
-    order_clusters(cx, &ct, &cpts, &cstart);
-    double t3 = at_clock();
+    bool gpu = false;
+    double t3 = 0.0;
+#if defined(AT_METAL)
+    at_metal_out g;
+    if (in->gpu_pending && at_metal_wait(in->metal, &g)) {
+        RunRows rr = {runs.data, row_off, 0};
+        uint32_t *sfirst, *scnt;
+        uint64_t *ssrc;
+        int64_t nc = gpu_clusters(cx, &g, rr, uf, nruns, cluster_map_size(w, h, 1), &cstart, &sfirst, &scnt, &ssrc);
+        td->timing.gpu = g.gpu_seconds;
+        in->gpu_used = true;
+        in->gpu_points = cstart.data[nc];
+        t3 = at_clock();
+        fit_quads_segments(cx, &td->qtp, (const Pt *)g.pts, cstart.data, nc, sfirst, scnt, ssrc, im, w, h, tag_width,
+                           normal_border, reversed_border, quads);
+        gpu = true;
+    }
+    in->gpu_pending = false;
+#endif
+    if (!gpu) {
+        ClusterTable ct;
+        ct_init(cx, &ct, cluster_map_size(w, h, 1));
+        uint32_t *rep = STK_ALLOC(cx, uint32_t, nnodes);
+        uint8_t *ok = STK_ALLOC(cx, uint8_t, nnodes);
+        resolve_range(uf, 0, nnodes, td->qtp.min_cluster_pixels, rep, ok);
+        if (h >= 3) {
+            /* rows 1..h-2, each against the row below */
+            PackedRows pr = {runs.data, row_off + 1, rep, ok};
+            gradient_points(cx, &ct, t + w, w, 1, h - 2, packed_row, &pr, rep + nruns + 1, ok + nruns + 1);
+        }
+        order_clusters(cx, &ct, &cpts, &cstart);
+        in->gpu_points = cpts.len - PT_PAD * (cstart.len - 1);
+        t3 = at_clock();
+        fit_quads(cx, &td->qtp, cpts.data, cstart.data, cstart.len - 1, PT_PAD, im, w, h, tag_width, normal_border,
+                  reversed_border, quads);
+    }
     td->timing.clusters = t3 - t2;
-    fit_quads(cx, &td->qtp, cpts.data, cstart.data, cstart.len - 1, PT_PAD, im, w, h, tag_width, normal_border,
-              reversed_border, quads);
     td->timing.fit_quads = at_clock() - t3;
 }
 
@@ -270,6 +296,19 @@ void at_detect(at_detector *td, const uint8_t *pixels, int64_t width, int64_t he
     if (nthreads > 1) pool_ensure(in, nthreads, qpx * AT_WORKER_BYTES_PER_PIXEL);
     bool pooled = nthreads > 1 && in->pool != NULL;
     at_mark mk = stk_enter(cx);
+#if defined(AT_METAL)
+    /* the GPU stage works from here on, until the clusters are needed */
+    in->gpu_used = false;
+    if (in->metal && qh >= 8) {
+        if (pooled) {
+            int64_t *tasks = STK_ALLOC(cx, int64_t, 2 * unionfind_max_tasks(qh));
+            int64_t nt = unionfind_tasks(qh, nthreads, tasks);
+            gpu_submit_region(td, pixels, width, height, stride, qh, nthreads, nt > 0 ? tasks[2 * nt - 1] : 1);
+        } else {
+            in->gpu_pending = gpu_choose(in) && gpu_submit(td, pixels, width, height, stride, qh, 0, qh - 1);
+        }
+    }
+#endif
     uint8_t *qim = in->buf_qim;
     /* with the pool, the threshold jobs decimate by 2 themselves (when
        nothing else changes the decimated image first) */
@@ -321,6 +360,9 @@ void at_detect(at_detector *td, const uint8_t *pixels, int64_t width, int64_t he
         td->nquads = quads.len;
         decode_quads(td, quads.data, quads.len, &view);
     }
+#if defined(AT_METAL)
+    gpu_finish(td, pooled);
+#endif
     double t_decode = at_clock();
     td->timing.decode = t_decode - t_quads;
 
@@ -332,4 +374,7 @@ void at_detect(at_detector *td, const uint8_t *pixels, int64_t width, int64_t he
     double t_end = at_clock();
     td->timing.reconcile = t_end - t_decode;
     td->timing.total = t_end - t_start;
+#if defined(AT_METAL)
+    if (!pooled) gpu_record(in, in->gpu_used, td->timing.clusters, in->gpu_points, nthreads);
+#endif
 }
