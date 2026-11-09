@@ -44,6 +44,40 @@ AT_INLINE void uf_connect(UfNode *uf, uint32_t a0, uint32_t b0) {
     }
 }
 
+/* uf_connect for a node a that no connect has touched yet (a root,
+   alone in its set): only b's chain is walked and compressed. The link
+   is the same as uf_connect's. */
+AT_INLINE void uf_connect_fresh(UfNode *uf, uint32_t a, uint32_t b0) {
+    uint32_t rb = b0;
+    for (uint32_t p; (p = uf[rb].parent) != rb;) rb = p;
+    uint32_t b = b0;
+    while (uf[b].parent != rb) {
+        uint32_t t = uf[b].parent;
+        uf[b].parent = rb;
+        b = t;
+    }
+    uint32_t asize = uf[a].size + 1;
+    uint32_t bsize = uf[rb].size + 1;
+    if (asize > bsize) {
+        uf[rb].parent = a;
+        uf[a].size += bsize;
+    } else {
+        uf[a].parent = rb;
+        uf[rb].size += asize;
+    }
+}
+
+/* The first connect of a run of the current row uses uf_connect_fresh
+   when the row was just initialized (fresh), else uf_connect. */
+#define UF_CONNECT(uf, a, b)                       \
+    do {                                           \
+        if (fresh && first)                        \
+            uf_connect_fresh(uf, a, b);            \
+        else                                       \
+            uf_connect(uf, a, b);                  \
+        first = false;                             \
+    } while (0)
+
 /* Initialize the nodes of one row's runs (n runs, first node base). */
 AT_INLINE void uf_init_row(UfNode *uf, const Run *runs, int64_t n, int64_t base) {
     for (int64_t i = 0; i < n; i++) {
@@ -65,13 +99,19 @@ AT_INLINE void last_column(UfNode *uf, int64_t w, int64_t y, const Run *cur, int
 /* Whether a row has a gap between runs (where a run of 127 was). */
 AT_INLINE bool has_gap(const Run *r, int64_t n) {
     int f = 0;
+    /* clang vectorizes this with a single-lane load per field (Run is
+       packed), which is slower than the scalar loop */
+#if defined(__clang__)
+#pragma clang loop vectorize(disable)
+#endif
     for (int64_t i = 1; i < n; i++) f |= r[i].start != r[i - 1].end + 1;
     return f != 0;
 }
 
 /* connect_rows for rows with any run values. */
 AT_INLINE void connect_rows_any(UfNode *uf, const uint8_t *edge, int64_t w, int64_t y, const Run *prev, int64_t nprev,
-                             int64_t prev_base, const Run *cur, int64_t ncur, int64_t cur_base, int64_t vcol_base) {
+                             int64_t prev_base, const Run *cur, int64_t ncur, int64_t cur_base, int64_t vcol_base,
+                             bool fresh) {
     uint8_t above_last = edge[2 * y - 1];
     uint8_t above_prev = edge[2 * y - 2];
     int64_t j = 0;
@@ -80,6 +120,7 @@ AT_INLINE void connect_rows_any(UfNode *uf, const uint8_t *edge, int64_t w, int6
         int64_t a1 = cur[i].end;
         uint8_t v = cur[i].v;
         uint32_t head_a = (uint32_t)(cur_base + i);
+        bool first = true;
         while (j < nprev && (int64_t)prev[j].end + 1 < a0) j++;
         for (int64_t k = j; k < nprev && prev[k].start <= a1 + 1; k++) {
             Run pk = prev[k];
@@ -89,14 +130,14 @@ AT_INLINE void connect_rows_any(UfNode *uf, const uint8_t *edge, int64_t w, int6
             int64_t lo = imax(imax(a0, b0), 1);
             int64_t hi = imin(a1, b1);
             if (lo <= hi) {
-                uf_connect(uf, head_a, head_b);
+                UF_CONNECT(uf, head_a, head_b);
             } else if (v == 255) {
                 int64_t xl = imax(imax(a0, b0 + 1), 1);
                 if (xl <= imin(a1, b1 + 1)) {
-                    uf_connect(uf, head_a, head_b);
+                    UF_CONNECT(uf, head_a, head_b);
                 } else {
                     int64_t xr = imax(imax(a0, b0 - 1), 1);
-                    if (xr <= imin(a1, b1 - 1)) uf_connect(uf, head_a, head_b);
+                    if (xr <= imin(a1, b1 - 1)) UF_CONNECT(uf, head_a, head_b);
                 }
             }
         }
@@ -109,9 +150,10 @@ AT_INLINE void connect_rows_any(UfNode *uf, const uint8_t *edge, int64_t w, int6
    edge[2*y+1] are the last two pixels of row y of the thresholded
    image. */
 AT_INLINE void connect_rows(UfNode *uf, const uint8_t *edge, int64_t w, int64_t y, const Run *prev, int64_t nprev,
-                            int64_t prev_base, const Run *cur, int64_t ncur, int64_t cur_base, int64_t vcol_base) {
-    if (has_gap(prev, nprev) || has_gap(cur, ncur)) {
-        connect_rows_any(uf, edge, w, y, prev, nprev, prev_base, cur, ncur, cur_base, vcol_base);
+                            int64_t prev_base, const Run *cur, int64_t ncur, int64_t cur_base, int64_t vcol_base,
+                            bool fresh, bool gap) {
+    if (gap) {
+        connect_rows_any(uf, edge, w, y, prev, nprev, prev_base, cur, ncur, cur_base, vcol_base, fresh);
         return;
     }
     /* The runs of 127 are not stored. Without them, the runs of a row
@@ -127,6 +169,7 @@ AT_INLINE void connect_rows(UfNode *uf, const uint8_t *edge, int64_t w, int64_t 
         int64_t a1 = cur[i].end;
         uint8_t v = cur[i].v;
         uint32_t head_a = (uint32_t)(cur_base + i);
+        bool first = true;
         while (j < nprev && (int64_t)prev[j].end + 1 < a0) j++;
         int64_t k = j;
         if (k < nprev && prev[k].v != v) k++;
@@ -136,7 +179,7 @@ AT_INLINE void connect_rows(UfNode *uf, const uint8_t *edge, int64_t w, int64_t 
                and b1 + 1 >= a0, so only a1 >= 1 is left to test */
             if (a1 >= 1) {
                 while (k < nprev && prev[k].start <= a1 + 1) {
-                    uf_connect(uf, head_a, (uint32_t)(prev_base + k));
+                    UF_CONNECT(uf, head_a, (uint32_t)(prev_base + k));
                     k += 2;
                 }
             }
@@ -144,7 +187,7 @@ AT_INLINE void connect_rows(UfNode *uf, const uint8_t *edge, int64_t w, int64_t 
             int64_t a0c = imax(a0, 1);
             while (k < nprev && prev[k].start <= a1 + 1) {
                 Run pk = prev[k];
-                if (imax(a0c, pk.start) <= imin(a1, pk.end)) uf_connect(uf, head_a, (uint32_t)(prev_base + k));
+                if (imax(a0c, pk.start) <= imin(a1, pk.end)) UF_CONNECT(uf, head_a, (uint32_t)(prev_base + k));
                 k += 2;
             }
         }
@@ -168,9 +211,11 @@ AT_INLINE int64_t row_count(RunRows rr, int64_t y) { return rr.row_off[y + 1] - 
 
 /* Union the runs of row y with the runs of row y-1. */
 AT_INLINE void connect_runs_to_prev(UfNode *uf, const uint8_t *edge, int64_t w, int64_t y, RunRows rr,
-                                    int64_t vcol_base) {
-    connect_rows(uf, edge, w, y, row_runs(rr, y - 1), row_count(rr, y - 1), rr.row_off[y - 1], row_runs(rr, y),
-                 row_count(rr, y), rr.row_off[y], vcol_base);
+                                    int64_t vcol_base, bool fresh) {
+    const Run *prev = row_runs(rr, y - 1), *cur = row_runs(rr, y);
+    int64_t nprev = row_count(rr, y - 1), ncur = row_count(rr, y);
+    connect_rows(uf, edge, w, y, prev, nprev, rr.row_off[y - 1], cur, ncur, rr.row_off[y], vcol_base, fresh,
+                 has_gap(prev, nprev) || has_gap(cur, ncur));
 }
 
 /* Process rows [y0, y1): initialize the row above the range, then each
@@ -178,9 +223,16 @@ AT_INLINE void connect_runs_to_prev(UfNode *uf, const uint8_t *edge, int64_t w, 
 static void unionfind_task(UfNode *uf, const uint8_t *edge, int64_t w, RunRows rr, int64_t vcol_base, int64_t y0,
                            int64_t y1) {
     uf_init_row(uf, row_runs(rr, y0 - 1), row_count(rr, y0 - 1), rr.row_off[y0 - 1]);
+    /* each row's gap test once, for it as cur and then as prev */
+    bool gprev = has_gap(row_runs(rr, y0 - 1), row_count(rr, y0 - 1));
     for (int64_t y = y0; y < y1; y++) {
-        uf_init_row(uf, row_runs(rr, y), row_count(rr, y), rr.row_off[y]);
-        connect_runs_to_prev(uf, edge, w, y, rr, vcol_base);
+        const Run *cur = row_runs(rr, y);
+        int64_t ncur = row_count(rr, y);
+        uf_init_row(uf, cur, ncur, rr.row_off[y]);
+        bool gcur = has_gap(cur, ncur);
+        connect_rows(uf, edge, w, y, row_runs(rr, y - 1), row_count(rr, y - 1), rr.row_off[y - 1], cur, ncur,
+                     rr.row_off[y], vcol_base, true, gprev || gcur);
+        gprev = gcur;
     }
 }
 
@@ -241,7 +293,7 @@ static void connected_components(at_ctx *cx, UfNode *uf, const uint8_t *edge, in
         unionfind_task(uf, edge, w, rr, vcol_base, tasks[2 * i], tasks[2 * i + 1]);
     /* join the tasks: connect the first row of each task (but the first)
        to the row above it, in task order */
-    for (int64_t i = 1; i < ntasks; i++) connect_runs_to_prev(uf, edge, w, tasks[2 * i] - 1, rr, vcol_base);
+    for (int64_t i = 1; i < ntasks; i++) connect_runs_to_prev(uf, edge, w, tasks[2 * i] - 1, rr, vcol_base, false);
     stk_leave(cx, mk);
 }
 
