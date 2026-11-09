@@ -157,7 +157,7 @@ SIMD_VOID(point_masks,
     const uint8_t *oa0 = oa + 1, *oap = oa + 2, *oam = oa;
     const uint8_t *ob0 = ob + 1, *obp = ob + 2, *obm = ob;
     uint8_t *out = e + 1;
-    for (int64_t x = 0; x < n; x++) {
+    AT_VFOR(x, 0, n, {
         uint8_t v = a0[x];
         uint8_t c10 = opp(v, ap[x]) & oap[x];
         uint8_t c01 = opp(v, b0[x]) & ob0[x];
@@ -166,7 +166,7 @@ SIMD_VOID(point_masks,
         /* the (1,1) point of the pixel to the left */
         uint8_t p11 = opp(am[x], b0[x]) & oam[x] & ob0[x];
         out[x] = (uint8_t)((c10 | (c01 << 1) | ((cm1 & (p11 ^ 1)) << 2) | (c11 << 3)) & (uint8_t)(oa0[x] * 15));
-    }
+    });
     /* x = 1 has no pixel to the left in the C loop */
     if ((a[1] ^ b[0]) == 255 && oa[1] != 0 && ob[0] != 0) e[1] |= 4;
     e[0] = opp(a[0], a[1]) != 0 && oa[0] != 0 && oa[1] != 0 ? 1 : 0;
@@ -175,7 +175,7 @@ SIMD_VOID(point_masks,
 
 /* p[i] = e[2i] | e[2i+1] << 4: the masks of 16 pixels in a u64. */
 SIMD_VOID(pack_nibbles, (const uint8_t *restrict e, uint8_t *restrict p, int64_t n), (e, p, n)) {
-    for (int64_t i = 0; i < n; i++) p[i] = (uint8_t)(e[2 * i] | (e[2 * i + 1] << 4));
+    AT_VFOR(i, 0, n, p[i] = (uint8_t)(e[2 * i] | (e[2 * i + 1] << 4)););
 }
 
 AT_INLINE Pt pt_of_bits(uint64_t v) {

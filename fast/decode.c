@@ -465,6 +465,42 @@ AT_INLINE double lane_weight(const uint8_t *im, int64_t s, double x0, double y0,
    0.25, exactly. So the bilinear values of the points
    x0 + (rf - 1 + 0.25 * j) * nx - 0.5, j in 0..n+8, give g1 (j = k + 8)
    and g2 (j = k) of every step: n + 8 values instead of 2n. */
+/* The loops of refine_batch, each with restrict pointers: its arrays are
+   all in fbuf, so without them clang needs runtime alias checks, which
+   it does not make at -Os (and they cost time at -O2). */
+AT_INLINE void rb_points(const double *restrict mjt, double x0, double y0, double nx, double ny, int64_t s,
+                         int64_t m, double *restrict fa, double *restrict bs, int64_t *restrict idx) {
+    AT_VFOR(j, 0, m, {
+        double mj = mjt[j];
+        double x = x0 + mj * nx - 0.5;
+        double y = y0 + mj * ny - 0.5;
+        double tx = trunc(x), ty = trunc(y);
+        fa[j] = x - tx;
+        bs[j] = y - ty;
+        idx[j] = low_int(ty) * s + low_int(tx);
+    });
+}
+
+AT_INLINE void rb_values(const double *restrict fa, const double *restrict bs, const uint32_t *restrict pk, int64_t m,
+                         double *restrict g) {
+    AT_VFOR(j, 0, m, {
+        double a = fa[j], b = bs[j];
+        double na = 1.0 - a, nb = 1.0 - b;
+        uint32_t p = pk[j];
+        double p00 = (double)(p & 255), p01 = (double)((p >> 8) & 255);
+        double p10 = (double)((p >> 16) & 255), p11 = (double)(p >> 24);
+        g[j] = ((na * nb) * p00 + (a * nb) * p01) + ((na * b) * p10 + (a * b) * p11);
+    });
+}
+
+AT_INLINE void rb_weights(const double *restrict g1s, const double *restrict g2s, int64_t n, double *restrict wgt) {
+    AT_VFOR(k, 0, n, {
+        double g1 = g1s[k], g2 = g2s[k];
+        double d = g2 - g1;
+        wgt[k] = !(g1 < g2) ? d * d : 0.0;
+    });
+}
+
 AT_INLINE void refine_batch(const uint8_t *restrict im, int64_t s, double x0, double y0, double nx, double ny,
                             int64_t n, double *restrict fbuf, int64_t *restrict ibuf, uint32_t *restrict pbuf) {
     int64_t m = n + 8;
@@ -474,15 +510,7 @@ AT_INLINE void refine_batch(const uint8_t *restrict im, int64_t s, double x0, do
     const double *mjt = fbuf + o + 3 * m;
     int64_t *idx = ibuf;
     uint32_t *pk = pbuf;
-    for (int64_t j = 0; j < m; j++) {
-        double mj = mjt[j];
-        double x = x0 + mj * nx - 0.5;
-        double y = y0 + mj * ny - 0.5;
-        double tx = trunc(x), ty = trunc(y);
-        fa[j] = x - tx;
-        bs[j] = y - ty;
-        idx[j] = low_int(ty) * s + low_int(tx);
-    }
+    rb_points(mjt, x0, y0, nx, ny, s, m, fa, bs, idx);
     /* the pixels of a sample in one u32: p00, p01, p10 and p11 in bytes
        0 to 3 */
     /* scalar: clang vectorizes it with an insert per load, which is
@@ -493,20 +521,9 @@ AT_INLINE void refine_batch(const uint8_t *restrict im, int64_t s, double x0, do
 #pragma GCC novector
 #endif
     for (int64_t j = 0; j < m; j++) pk[j] = ld2(im + idx[j]) | ((uint32_t)ld2(im + idx[j] + s) << 16);
-    for (int64_t j = 0; j < m; j++) {
-        double a = fa[j], b = bs[j];
-        double na = 1.0 - a, nb = 1.0 - b;
-        uint32_t p = pk[j];
-        double p00 = (double)(p & 255), p01 = (double)((p >> 8) & 255);
-        double p10 = (double)((p >> 16) & 255), p11 = (double)(p >> 24);
-        g[j] = ((na * nb) * p00 + (a * nb) * p01) + ((na * b) * p10 + (a * b) * p11);
-    }
-    const double *g1s = g + 8, *g2s = g;
-    for (int64_t k = 0; k < n; k++) {
-        double g1 = g1s[k], g2 = g2s[k];
-        double d = g2 - g1;
-        wgt[k] = !(g1 < g2) ? d * d : 0.0;
-    }
+    rb_values(fa, bs, pk, m, g);
+    /* g1 of step k is point k + 8, g2 is point k */
+    rb_weights(g + 8, g, n, wgt);
 }
 
 /* The weighted sums of refine_edges over the first vsteps steps (a
@@ -584,10 +601,10 @@ SIMD_VOID(refine_lanes,
 static void refine_tables(double *fbuf, int64_t n, double rf) {
     int64_t m = n + 8;
     double *ns = fbuf + n;
-    for (int64_t k = 0; k < n; k++) ns[k] = rf + 0.25 * (double)k;
+    AT_VFOR(k, 0, n, ns[k] = rf + 0.25 * (double)k;);
     double rm = rf - 1.0;
     double *mjt = fbuf + 2 * n + 3 * m;
-    for (int64_t j = 0; j < m; j++) mjt[j] = rm + 0.25 * (double)j;
+    AT_VFOR(j, 0, m, mjt[j] = rm + 0.25 * (double)j;);
 }
 
 #define PREFETCH_AHEAD 2

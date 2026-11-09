@@ -16,7 +16,7 @@ SIMD_VOID(tile_minmax_row,
           (const uint8_t *restrict r0, const uint8_t *restrict r1, const uint8_t *restrict r2,
            const uint8_t *restrict r3, uint8_t *restrict mx, uint8_t *restrict mn, int64_t tw),
           (r0, r1, r2, r3, mx, mn, tw)) {
-    for (int64_t tx = 0; tx < tw; tx++) {
+    AT_VFOR(tx, 0, tw, {
         int64_t x = 4 * tx;
         uint8_t hi = max8(max8(max8(r0[x], r0[x + 1]), max8(r0[x + 2], r0[x + 3])),
                           max8(max8(r1[x], r1[x + 1]), max8(r1[x + 2], r1[x + 3])));
@@ -28,7 +28,7 @@ SIMD_VOID(tile_minmax_row,
                            min8(min8(r3[x], r3[x + 1]), min8(r3[x + 2], r3[x + 3]))));
         mx[tx] = hi;
         mn[tx] = lo;
-    }
+    });
 }
 
 /* 3-wide horizontal max/min of one tile row (edges use what exists). */
@@ -43,10 +43,10 @@ SIMD_VOID(tile_hblur_row,
     }
     omx[0] = max8(mx[0], mx[1]);
     omn[0] = min8(mn[0], mn[1]);
-    for (int64_t tx = 1; tx < tw - 1; tx++) {
+    AT_VFOR(tx, 1, tw - 1, {
         omx[tx] = max8(max8(mx[tx - 1], mx[tx]), mx[tx + 1]);
         omn[tx] = min8(min8(mn[tx - 1], mn[tx]), mn[tx + 1]);
-    }
+    });
     omx[tw - 1] = max8(mx[tw - 2], mx[tw - 1]);
     omn[tw - 1] = min8(mn[tw - 2], mn[tw - 1]);
 }
@@ -54,13 +54,13 @@ SIMD_VOID(tile_hblur_row,
 SIMD_VOID(vmax3, (const uint8_t *restrict a, const uint8_t *restrict b, const uint8_t *restrict c, uint8_t *restrict o,
                   int64_t n),
           (a, b, c, o, n)) {
-    for (int64_t i = 0; i < n; i++) o[i] = max8(max8(a[i], b[i]), c[i]);
+    AT_VFOR(i, 0, n, o[i] = max8(max8(a[i], b[i]), c[i]););
 }
 
 SIMD_VOID(vmin3, (const uint8_t *restrict a, const uint8_t *restrict b, const uint8_t *restrict c, uint8_t *restrict o,
                   int64_t n),
           (a, b, c, o, n)) {
-    for (int64_t i = 0; i < n; i++) o[i] = min8(min8(a[i], b[i]), c[i]);
+    AT_VFOR(i, 0, n, o[i] = min8(min8(a[i], b[i]), c[i]););
 }
 
 /* The per-pixel thresholds of one tile row (w pixels, tw tiles): thr[x]
@@ -95,10 +95,10 @@ SIMD_VOID(threshold_row,
           (const uint8_t *restrict src, const uint8_t *restrict thr, const uint8_t *restrict flat,
            uint8_t *restrict out, int64_t w),
           (src, thr, flat, out, w)) {
-    for (int64_t x = 0; x < w; x++) {
+    AT_VFOR(x, 0, w, {
         uint8_t v = src[x] > thr[x] ? 255 : 0;
         out[x] = flat[x] != 0 ? 127 : v;
-    }
+    });
 }
 
 /* The rows of tile rows [ty0, ty1) of the thresholded image; the last
@@ -195,16 +195,16 @@ static void deglitch(at_ctx *cx, uint8_t *t, int64_t w, int64_t h) {
 /* c[i] = 1 where row[i + 1] differs from row[i], else 0 (n entries). */
 SIMD_VOID(row_changes, (const uint8_t *restrict row, uint8_t *restrict c, int64_t n), (row, c, n)) {
     const uint8_t *a = row + 1;
-    for (int64_t i = 0; i < n; i++) c[i] = a[i] != row[i] ? 1 : 0;
+    AT_VFOR(i, 0, n, c[i] = a[i] != row[i] ? 1 : 0;);
 }
 
 /* Bit k of p[i] is c[8i + k] (0 or 1), for i < n. */
 SIMD_VOID(pack_bits, (const uint8_t *restrict c, uint8_t *restrict p, int64_t n), (c, p, n)) {
-    for (int64_t i = 0; i < n; i++) {
+    AT_VFOR(i, 0, n, {
         int64_t j = 8 * i;
         p[i] = (uint8_t)((c[j] | (c[j + 1] << 1)) | ((c[j + 2] << 2) | (c[j + 3] << 3)) |
                          ((c[j + 4] << 4) | (c[j + 5] << 5)) | ((c[j + 6] << 6) | (c[j + 7] << 7)));
-    }
+    });
 }
 
 /* The runs of one thresholded row of w pixels (pixels [0, w-2]) into

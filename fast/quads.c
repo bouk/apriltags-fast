@@ -458,10 +458,10 @@ AT_INLINE uint64_t point_key(float dx, float dy, int64_t idx) {
 #endif
 SIMD_FN(float, point_keys, (const Pt *restrict pts, int64_t sz, float cx, float cy, uint64_t *restrict keys),
         (pts, sz, cx, cy, keys)) {
-    for (int64_t i = 0; i < sz; i++) {
+    AT_VFOR(i, 0, sz, {
         Pt p = pts[i];
         keys[i] = point_key(p.x - cx, p.y - cy, i);
-    }
+    });
     int64_t nv = sz - sz % 8;
 #ifdef AT_HAVE_SHUFFLE
     typedef float v8f __attribute__((vector_size(32)));
@@ -506,13 +506,13 @@ SIMD_FN(float, point_keys, (const Pt *restrict pts, int64_t sz, float cx, float 
 /* The bounding box of the points: xmin, xmax, ymin, ymax. */
 SIMD_VOID(point_bounds, (const Pt *restrict pts, int64_t n, uint16_t *restrict out), (pts, n, out)) {
     uint16_t xmin = 0xffff, xmax = 0, ymin = 0xffff, ymax = 0;
-    for (int64_t i = 0; i < n; i++) {
+    AT_VFOR(i, 0, n, {
         Pt p = pts[i];
         xmin = p.x < xmin ? p.x : xmin;
         xmax = p.x > xmax ? p.x : xmax;
         ymin = p.y < ymin ? p.y : ymin;
         ymax = p.y > ymax ? p.y : ymax;
-    }
+    });
     out[0] = xmin;
     out[1] = xmax;
     out[2] = ymin;
@@ -607,7 +607,7 @@ SIMD_VOID(window_errors,
     const double *uxxs = amxx + u0, *lxxs = amxx + l0, *uxys = amxy + u0, *lxys = amxy + l0;
     const double *uyys = amyy + u0, *lyys = amyy + l0, *uws = aw + u0, *lws = aw + l0;
     double *out = errs + lo;
-    for (int64_t k = 0; k < n; k++) {
+    AT_VFOR(k, 0, n, {
         double mx = uxs[k] - lxs[k];
         double my = uys[k] - lys[k];
         double mxx = uxxs[k] - lxxs[k];
@@ -622,7 +622,7 @@ SIMD_VOID(window_errors,
         double d = cxx - cyy;
         double root = (double)at_sqrtf((float)(d * d + 4.0 * (cxy * cxy)));
         out[k] = nn * (0.5 * (cxx + cyy - root));
-    }
+    });
 }
 
 /* fit_line's error for n windows of nn points with these moments. */
@@ -631,7 +631,7 @@ SIMD_VOID(moment_errors,
            const double *restrict amxy, const double *restrict amyy, const double *restrict aw, double nn,
            double *restrict out, int64_t n),
           (amx, amy, amxx, amxy, amyy, aw, nn, out, n)) {
-    for (int64_t k = 0; k < n; k++) {
+    AT_VFOR(k, 0, n, {
         double w = aw[k];
         double ex = amx[k] / w;
         double ey = amy[k] / w;
@@ -641,7 +641,7 @@ SIMD_VOID(moment_errors,
         double d = cxx - cyy;
         double root = (double)at_sqrtf((float)(d * d + 4.0 * (cxy * cxy)));
         out[k] = nn * (0.5 * (cxx + cyy - root));
-    }
+    });
 }
 
 /* The window errors of the first and last windows, which wrap around
@@ -702,7 +702,7 @@ SIMD_VOID(filter_errors, (const double *restrict errs, double *restrict y, const
                  *e6 = errs + 6;
     double *out = y + 3;
     double k0 = kern[0], k1 = kern[1], k2 = kern[2], k3 = kern[3], k4 = kern[4], k5 = kern[5], k6 = kern[6];
-    for (int64_t k = 0; k < m; k++) {
+    AT_VFOR(k, 0, m, {
         double acc = e0[k] * k0;
         acc += e1[k] * k1;
         acc += e2[k] * k2;
@@ -711,7 +711,7 @@ SIMD_VOID(filter_errors, (const double *restrict errs, double *restrict y, const
         acc += e5[k] * k5;
         acc += e6[k] * k6;
         out[k] = acc;
-    }
+    });
     for (int64_t e = 0; e < 6; e++) {
         int64_t iy = e < 3 ? e : sz - 6 + e;
         double acc = 0.0;
@@ -745,7 +745,7 @@ SIMD_VOID(pair_lines,
            const double *restrict pn, double *restrict onx, double *restrict ony, double *restrict oerr,
            double *restrict omse, int64_t n),
           (pmx, pmy, pmxx, pmxy, pmyy, pw, pn, onx, ony, oerr, omse, n)) {
-    for (int64_t k = 0; k < n; k++) {
+    AT_VFOR(k, 0, n, {
         double w = pw[k];
         double ex = pmx[k] / w;
         double ey = pmy[k] / w;
@@ -772,7 +772,7 @@ SIMD_VOID(pair_lines,
         ony[k] = ok ? ny / length : 0.0;
         oerr[k] = pn[k] * eig_small;
         omse[k] = eig_small;
-    }
+    });
 }
 
 /* Find the four corners into indices. Returns false if no good quad
@@ -959,14 +959,14 @@ static bool quad_segment_maxima(const at_quad_thresh_params *qtp, QuadScratch *s
    neighbor of it is outside the image (gradient 0). */
 SIMD_VOID(point_centers, (const Pt *restrict pts, int64_t n, int32_t iw, int32_t ih, int32_t *restrict ci),
           (pts, n, iw, ih, ci)) {
-    for (int64_t i = 0; i < n; i++) {
+    AT_VFOR(i, 0, n, {
         int32_t px = pts[i].x;
         int32_t py = pts[i].y;
         int32_t ix = (px >> 1) + (px & 1);
         int32_t iy = (py >> 1) + (py & 1);
         bool inside = ix > 0 && ix + 1 < iw && iy > 0 && iy + 1 < ih;
         ci[i] = inside ? iy * iw + ix : -1;
-    }
+    });
 }
 
 static void point_gradients(const int32_t *ci, int64_t n, const uint8_t *im, int64_t iw, double *wb) {
@@ -991,7 +991,7 @@ static void point_gradients(const int32_t *ci, int64_t n, const uint8_t *im, int
 }
 
 SIMD_VOID(sqrt_plus_one, (double *restrict v, int64_t n), (v, n)) {
-    for (int64_t i = 0; i < n; i++) v[i] = at_sqrt(v[i]) + 1.0;
+    AT_VFOR(i, 0, n, v[i] = at_sqrt(v[i]) + 1.0;);
 }
 
 /* Cumulative weighted moments of the points in key order. */

@@ -25,6 +25,36 @@
 
 #define AT_INLINE static inline __attribute__((always_inline))
 #define AT_NOINLINE __attribute__((noinline))
+/* AT_VFOR(i, lo, hi, body): for (int64_t i = lo; i < hi; i++) body, for
+   the loops that clang vectorizes. Xcode builds Swift package C code with
+   -Os in Release. There clang vectorizes a loop only if it needs no
+   scalar remainder loop, so these loops stayed scalar (the detector was
+   about 1.5x slower than at -O2). At -Os the loop is split into a part of
+   a multiple of 16 iterations, which vectorizes, and a scalar remainder.
+   At other levels it is the plain loop, so -O2 code does not change. */
+#if defined(__clang__) && defined(__OPTIMIZE_SIZE__)
+#define AT_VFOR(i, lo, hi, ...)                                                    \
+    do {                                                                          \
+        int64_t at_lo_ = (lo), at_n_ = (hi) - at_lo_;                             \
+        int64_t at_nv_ = at_n_ > 0 ? at_n_ & ~(int64_t)15 : 0;                    \
+        for (int64_t at_k_ = 0; at_k_ < at_nv_; at_k_++) {                        \
+            int64_t i = at_lo_ + at_k_;                                           \
+            __VA_ARGS__                                                           \
+        }                                                                         \
+        _Pragma("clang loop vectorize(disable) unroll(disable)") for (int64_t i = \
+                                                                          at_lo_ + at_nv_; \
+                                                                      i < at_lo_ + at_n_; i++) { \
+            __VA_ARGS__                                                           \
+        }                                                                         \
+    } while (0)
+#else
+#define AT_VFOR(i, lo, hi, ...)                \
+    do {                                      \
+        for (int64_t i = (lo); i < (hi); i++) { \
+            __VA_ARGS__                       \
+        }                                     \
+    } while (0)
+#endif
 #define AT_LIKELY(x) __builtin_expect(!!(x), 1)
 #define AT_UNLIKELY(x) __builtin_expect(!!(x), 0)
 

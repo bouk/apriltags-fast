@@ -45,25 +45,32 @@ SIMD_VOID(decimate2_row, (const uint8_t *restrict r0, const uint8_t *restrict r1
     }
 }
 
+/* Two output rows of the 1.5 decimation from three input rows (restrict:
+   no runtime alias checks, which clang does not make at -Os). */
+AT_INLINE void decimate15_rows(const uint8_t *restrict s0, const uint8_t *restrict s1, const uint8_t *restrict s2,
+                               uint8_t *restrict o0, uint8_t *restrict o1, int64_t ow) {
+    AT_VFOR(k, 0, ow / 2, {
+        int64_t sx = 2 * k, x = 3 * k;
+        int32_t a = s0[x], b = s0[x + 1], c = s0[x + 2];
+        int32_t d = s1[x], e = s1[x + 1], f = s1[x + 2];
+        int32_t g = s2[x], h = s2[x + 1], i = s2[x + 2];
+        o0[sx] = (uint8_t)((4 * a + 2 * b + 2 * d + e) / 9);
+        o0[sx + 1] = (uint8_t)((4 * c + 2 * b + 2 * f + e) / 9);
+        o1[sx] = (uint8_t)((4 * g + 2 * d + 2 * h + e) / 9);
+        o1[sx + 1] = (uint8_t)((4 * i + 2 * f + 2 * h + e) / 9);
+    });
+}
+
 /* Decimate src (rows stride bytes apart) into out (rows ow bytes apart),
    rows [sy0, sy1) of the output. The factor is 1.5, 2 (2x2 box filter),
    or an integer (point sampling). */
-static void decimate_rows(const uint8_t *src, int64_t stride, float ffactor, uint8_t *out, int64_t ow, int64_t sy0,
-                          int64_t sy1) {
+static void decimate_rows(const uint8_t *restrict src, int64_t stride, float ffactor, uint8_t *restrict out,
+                          int64_t ow, int64_t sy0, int64_t sy1) {
     if (ffactor == 1.5f) {
         for (int64_t sy = sy0; sy < sy1; sy += 2) {
-            int64_t y = sy / 2 * 3;
-            const uint8_t *s0 = src + y * stride, *s1 = s0 + stride, *s2 = s1 + stride;
-            uint8_t *o0 = out + sy * ow, *o1 = o0 + ow;
-            for (int64_t sx = 0, x = 0; sx < ow; sx += 2, x += 3) {
-                int32_t a = s0[x], b = s0[x + 1], c = s0[x + 2];
-                int32_t d = s1[x], e = s1[x + 1], f = s1[x + 2];
-                int32_t g = s2[x], h = s2[x + 1], i = s2[x + 2];
-                o0[sx] = (uint8_t)((4 * a + 2 * b + 2 * d + e) / 9);
-                o0[sx + 1] = (uint8_t)((4 * c + 2 * b + 2 * f + e) / 9);
-                o1[sx] = (uint8_t)((4 * g + 2 * d + 2 * h + e) / 9);
-                o1[sx + 1] = (uint8_t)((4 * i + 2 * f + 2 * h + e) / 9);
-            }
+            const uint8_t *s0 = src + sy / 2 * 3 * stride;
+            uint8_t *o0 = out + sy * ow;
+            decimate15_rows(s0, s0 + stride, s0 + 2 * stride, o0, o0 + ow, ow);
         }
         return;
     }
@@ -83,7 +90,8 @@ static void decimate_rows(const uint8_t *src, int64_t stride, float ffactor, uin
 /* The 1D convolution of the C library. `parallel` selects the variant of
    image_u8_parallel.c (used for images of 65536 pixels or more), which
    convolves one more output pixel than the single-threaded image_u8.c. */
-static void convolve(const uint8_t *x, uint8_t *y, int64_t sz, const uint8_t *k, int64_t ksz, bool parallel) {
+static void convolve(const uint8_t *restrict x, uint8_t *restrict y, int64_t sz, const uint8_t *restrict k,
+                     int64_t ksz, bool parallel) {
     int64_t i = 0;
     while (i < ksz / 2 && i < sz) {
         y[i] = x[i];

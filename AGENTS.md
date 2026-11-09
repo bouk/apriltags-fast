@@ -78,6 +78,15 @@ a shared machine is 5% or more. Compare min and median per stage.
   - `Run` is packed (5 bytes). `connect_rows_any` is inlined.
   - The scalar pixel loop of `refine_batch` stays scalar
     (`vectorize(disable)` / `GCC novector`).
+  - Loops that must vectorize use `AT_VFOR`. Xcode builds the C code of a
+    Swift package with `-Os` (Release), where clang vectorizes a loop only
+    if it needs no scalar remainder loop; without `AT_VFOR` the detector
+    is 1.5x slower there. Check with `clang -target arm64-apple-ios15.0
+    -Os -Rpass=loop-vectorize`. Do not use `#pragma clang loop
+    vectorize(enable)` for this: at `-Os` it masks the remainder (one
+    branch per lane), and it lets clang reorder FP reductions.
+  - Give each such loop `restrict` pointers (an `AT_INLINE` helper if the
+    arrays share one buffer): at `-Os` clang makes no runtime alias checks.
 - Tools: callgrind instruction counts per function on both compilers find
   a loop that one compiler does not vectorize; `-fopt-info-vec-missed`
   gives gcc's reason. Valgrind has no AVX-512: it runs the AVX2 versions.

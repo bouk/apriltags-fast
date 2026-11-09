@@ -80,10 +80,10 @@ AT_INLINE void uf_connect_fresh(UfNode *uf, uint32_t a, uint32_t b0) {
 
 /* Initialize the nodes of one row's runs (n runs, first node base). */
 AT_INLINE void uf_init_row(UfNode *uf, const Run *runs, int64_t n, int64_t base) {
-    for (int64_t i = 0; i < n; i++) {
+    AT_VFOR(i, 0, n, {
         uf[base + i].parent = (uint32_t)(base + i);
         uf[base + i].size = (uint32_t)(runs[i].end - runs[i].start);
-    }
+    });
 }
 
 /* A white run that ends at column w-2 joins the virtual node of the row
@@ -260,7 +260,7 @@ static int64_t unionfind_tasks(int64_t h, int64_t nthreads, int64_t *out) {
 }
 
 /* The last two pixels of each row, for connect_runs_to_prev. */
-static void row_edges(const uint8_t *t, int64_t w, int64_t h, uint8_t *edge) {
+static void row_edges(const uint8_t *restrict t, int64_t w, int64_t h, uint8_t *restrict edge) {
     for (int64_t y = 0; y < h; y++) {
         edge[2 * y] = t[y * w + w - 2];
         edge[2 * y + 1] = t[y * w + w - 1];

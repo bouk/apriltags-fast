@@ -2,8 +2,8 @@
    can inline across the stages (as Goose does with its one C file). */
 /* No FP contraction (FMA): the output must not depend on it. This also
    holds where the build cannot pass -ffp-contract=off (SwiftPM). */
-#pragma STDC FP_CONTRACT OFF
 #ifdef __clang__
+#pragma STDC FP_CONTRACT OFF
 #pragma clang fp contract(off)
 #endif
 
