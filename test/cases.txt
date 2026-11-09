@@ -1,0 +1,18 @@
+default	-t 1
+x1	-t 1 -x 1
+x15	-t 1 -x 1.5
+x3	-t 1 -x 3
+blur	-t 1 -b 0.8
+sharpen	-t 1 -b -0.8
+norefine	-t 1 -0
+std41	-t 1 -f tagStandard41h12
+std52	-t 1 -f tagStandard52h13 -x 1
+tag16h5	-t 1 -f tag16h5 -x 1
+tag25h9	-t 1 -f tag25h9 -x 1
+custom48	-t 1 -f tagCustom48h12 -x 1
+hamming3	-t 1 -a 3
+deglitch	-t 1 --deglitch -x 1
+t2deglitch	-t 2 --deglitch -x 1
+t4	-t 4
+t4x1	-t 4 -x 1
+t8x15	-t 8 -x 1.5
