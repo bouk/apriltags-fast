@@ -103,10 +103,18 @@ static int64_t cluster_map_size(int64_t w, int64_t h, int64_t nthreads) {
 }
 
 AT_INLINE void fill8(uint32_t *lab, uint8_t *okb, uint32_t r, uint8_t o) {
+#if defined(__ARM_NEON)
+    /* clang makes the loop 16 scalar stores on arm64 */
+    uint32x4_t vr = vdupq_n_u32(r);
+    vst1q_u32(lab, vr);
+    vst1q_u32(lab + 4, vr);
+    vst1_u8(okb, vdup_n_u8(o));
+#else
     for (int k = 0; k < 8; k++) {
         lab[k] = r;
         okb[k] = o;
     }
+#endif
 }
 
 /* The labels of one row (w pixels) from its runs; pixels without a run

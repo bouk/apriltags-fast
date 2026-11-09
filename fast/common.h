@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif

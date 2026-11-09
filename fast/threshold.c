@@ -216,9 +216,31 @@ static int64_t rle_row(const uint8_t *row, int64_t w, Run *out, uint8_t *cb, uin
        1 + 64k .. 64k + 64, the changes cb[64k .. 64k + 64]; the last
        block has zeros past xmax */
     int64_t nb = (xmax + 63) / 64;
-    row_changes(row, cb, xmax);
-    memset(cb + xmax, 0, (size_t)(64 * nb - xmax));
-    pack_bits(cb, pb, 8 * nb);
+    int64_t k0 = 0;
+#if defined(__ARM_NEON)
+    /* the whole blocks (they read row[64k .. 64k + 64]) with NEON
+       compares and a pairwise-add movemask: pack_bits is single-lane
+       loads on arm64 */
+    int64_t nfull = imin((w - 2) / 64, nb);
+    const uint8x16_t wt = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    for (int64_t k = 0; k < nfull; k++) {
+        const uint8_t *r = row + 64 * k;
+        uint8x16_t m0 = vandq_u8(vmvnq_u8(vceqq_u8(vld1q_u8(r + 1), vld1q_u8(r))), wt);
+        uint8x16_t m1 = vandq_u8(vmvnq_u8(vceqq_u8(vld1q_u8(r + 17), vld1q_u8(r + 16))), wt);
+        uint8x16_t m2 = vandq_u8(vmvnq_u8(vceqq_u8(vld1q_u8(r + 33), vld1q_u8(r + 32))), wt);
+        uint8x16_t m3 = vandq_u8(vmvnq_u8(vceqq_u8(vld1q_u8(r + 49), vld1q_u8(r + 48))), wt);
+        uint8x16_t t = vpaddq_u8(vpaddq_u8(m0, m1), vpaddq_u8(m2, m3));
+        t = vpaddq_u8(t, t);
+        vst1_u8(pb + 8 * k, vget_low_u8(t));
+    }
+    k0 = nfull;
+#endif
+    if (k0 < nb) {
+        int64_t x0 = 64 * k0;
+        row_changes(row + x0, cb, xmax - x0);
+        memset(cb + (xmax - x0), 0, (size_t)(64 * nb - xmax));
+        pack_bits(cb, pb + 8 * k0, 8 * (nb - k0));
+    }
     int64_t n = 0;
     int64_t start = 0;
     uint8_t v = row[0];

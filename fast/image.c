@@ -26,7 +26,15 @@ static void decimated_size(int64_t width, int64_t height, float ffactor, int64_t
 SIMD_VOID(decimate2_row, (const uint8_t *restrict r0, const uint8_t *restrict r1, uint8_t *restrict o, int64_t n),
           (r0, r1, o, n)) {
     int64_t nv = n - n % 32;
-    for (int64_t sx = 0; sx < nv; sx++) {
+    int64_t sx0 = 0;
+#if defined(__ARM_NEON)
+    /* vrhadd is the rounded average of the AVX2 path */
+    for (; sx0 < nv; sx0 += 16) {
+        uint8x16x2_t a = vld2q_u8(r0 + 2 * sx0), b = vld2q_u8(r1 + 2 * sx0);
+        vst1q_u8(o + sx0, vrhaddq_u8(vrhaddq_u8(a.val[0], b.val[0]), vrhaddq_u8(a.val[1], b.val[1])));
+    }
+#endif
+    for (int64_t sx = sx0; sx < nv; sx++) {
         uint16_t v0 = (uint16_t)((r0[2 * sx] + r1[2 * sx] + 1) >> 1);
         uint16_t v1 = (uint16_t)((r0[2 * sx + 1] + r1[2 * sx + 1] + 1) >> 1);
         o[sx] = (uint8_t)((v0 + v1 + 1) >> 1);
