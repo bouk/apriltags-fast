@@ -8,8 +8,8 @@ endif()
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(BUILD_EXAMPLES "Build example executables" ON)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "apriltags-fast supports Linux only (the worker pool uses futexes)")
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin|iOS)$")
+    message(FATAL_ERROR "apriltags-fast supports Linux and Apple platforms only (the worker pool uses futexes or ulocks)")
 endif()
 
 set(default_build_type "Release")

@@ -30,11 +30,22 @@
    cancelled: it would find no task left. */
 #include "common.h"
 
-#include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
-#include <sys/syscall.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#elif defined(__APPLE__)
+/* Darwin's futex: the ulock calls in libSystem (used by libc++ too). */
+extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout);
+extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+#define UL_COMPARE_AND_WAIT 1
+#define ULF_NO_ERRNO 0x01000000
+#else
+#error "apriltags-fast needs a futex (Linux) or ulock (Darwin)"
+#endif
 
 #define POST_FAN 4
 #define AT_MAX_WORKERS 63
@@ -86,11 +97,23 @@ struct at_pool {
     uint32_t *troot; /* the roots of the first and last row of each task */
 };
 
-static long futex(uint32_t *addr, int op, uint32_t val) {
-    return syscall(SYS_futex, addr, op, val, NULL, NULL, 0);
+#if defined(__linux__)
+static void addr_wait(uint32_t *addr, uint32_t val) {
+    syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, val, NULL, NULL, 0);
 }
+static void addr_wake(uint32_t *addr) {
+    syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+#else
+static void addr_wait(uint32_t *addr, uint32_t val) {
+    __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, val, 0);
+}
+static void addr_wake(uint32_t *addr) {
+    __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, 0);
+}
+#endif
 
-static void wake_worker(Worker *wk) { futex(&wk->word, FUTEX_WAKE_PRIVATE, 1); }
+static void wake_worker(Worker *wk) { addr_wake(&wk->word); }
 
 /* One step of a wait loop: a pause for the first 256 steps, then a
    yield (with more threads than cores, the thread that the loop waits
@@ -189,7 +212,7 @@ static void *worker_main(void *arg) {
             }
             continue;
         }
-        futex(&wk->word, FUTEX_WAIT_PRIVATE, wv);
+        addr_wait(&wk->word, wv);
     }
     at_ctx_release(&wk->cx);
     return NULL;
